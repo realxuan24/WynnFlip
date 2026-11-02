@@ -93,28 +93,68 @@ def per_item(session,key,name):
         return None
     return cached('item:'+name.casefold(),1800,work)
 
-def store_request(op,key,value=None):
-    url=os.environ.get('UPSTASH_REDIS_REST_URL','').rstrip('/')
-    token=os.environ.get('UPSTASH_REDIS_REST_TOKEN','')
-    if not (url and token):return None
-    args=[op,key]+([] if value is None else [value])
+def redis_call(commands):
+    """Return (results, error). No secrets are included in diagnostics."""
+    url=os.environ.get('UPSTASH_REDIS_REST_URL','').strip().rstrip('/')
+    token=os.environ.get('UPSTASH_REDIS_REST_TOKEN','').strip()
+    if not url or not token:return None,'not configured'
     try:
-        r=requests.post(url+'/pipeline',headers={'Authorization':'Bearer '+token},json=[args],timeout=4)
-        r.raise_for_status(); data=r.json()
-        if isinstance(data,list) and data:return data[0].get('result')
-    except (requests.RequestException,ValueError,TypeError): pass
-    return None
+        res=requests.post(url+'/pipeline',headers={'Authorization':'Bearer '+token},json=commands,timeout=9)
+        res.raise_for_status()
+        data=res.json()
+        if not isinstance(data,list) or len(data)!=len(commands):return None,'invalid Redis response'
+        errors=[r.get('error') for r in data if isinstance(r,dict) and r.get('error')]
+        if errors:return None,'Redis command failed: '+str(errors[0])[:120]
+        return [r.get('result') for r in data],None
+    except (requests.RequestException,ValueError,TypeError) as exc:
+        return None,type(exc).__name__
 
 def load_history():
-    raw=store_request('GET','wynnflip:v12:history')
+    values,error=redis_call([['GET','wynnflip:v12:history']])
+    if error:return {},error
     try:
-        data=json.loads(raw) if raw else {}
-        return data if isinstance(data,dict) else {}
-    except (TypeError,ValueError):return {}
+        obj=json.loads(values[0]) if values[0] else {}
+        if not isinstance(obj,dict):return {},'invalid stored history shape'
+        return obj,None
+    except (TypeError,ValueError):return {},'invalid stored history JSON'
 
-def persist_history(data):
-    # Best-effort snapshot: suitable for small projects, not atomic under concurrent writers.
-    store_request('SET','wynnflip:v12:history',json.dumps(data,separators=(',',':')))
+# Atomic Redis Lua merge prevents multiple visitors from overwriting one another.
+# Original observation IDs are stable, so repeat scans do not increase counts.
+HISTORY_MERGE_LUA = """
+local raw=redis.call('GET',KEYS[1])
+local current={observations={}}
+if raw then
+  local ok,obj=pcall(cjson.decode,raw)
+  if ok and type(obj)=='table' and type(obj.observations)=='table' then current=obj end
+end
+local obs=current.observations
+local incoming=cjson.decode(ARGV[1])
+for id,value in pairs(incoming) do
+  if obs[id]==nil then obs[id]=value end
+end
+local keyed={}
+for id,val in pairs(obs) do
+  table.insert(keyed,{id=id,t=tonumber(val.observed_at or 0) or 0})
+end
+table.sort(keyed,function(a,b) if a.t==b.t then return a.id<b.id else return a.t>b.t end end)
+for j=3001,#keyed do obs[keyed[j].id]=nil end
+redis.call('SET',KEYS[1],cjson.encode(current))
+return math.min(#keyed,3000)
+"""
+
+def persist_history(rows):
+    incoming={}
+    now=time.time()
+    for r in rows:
+        p=number(r.get('listing_price'))
+        if not r.get('name') or p is None or p<=0:continue
+        ident=str(r.get('hash_code') or (str(r.get('name'))+':'+str(p)+':'+str(r.get('timestamp'))))
+        incoming[ident]={'name':r['name'],'listing_price':p,'tier':r.get('tier'),
+            'stat_rolls':r.get('stat_rolls') if isinstance(r.get('stat_rolls'),dict) else {},
+            'hash_code':ident,'timestamp':r.get('timestamp'),'observed_at':now}
+    if not incoming:return None,'no valid observations to save'
+    result,error=redis_call([['EVAL',HISTORY_MERGE_LUA,1,'wynnflip:v12:history',json.dumps(incoming,separators=(',',':'))]])
+    return (int(result[0]) if result and result[0] is not None else None),error
 
 def apply_baselines(items,baselines,session,key):
     filled=0; lookups=0; groups=defaultdict(list)
@@ -186,6 +226,80 @@ def augment(items,reference):
         else:item['v12_signal']='market'
     return items
 
+def suppress_trivial_leads(items):
+    """Keep cheap/bulk listings searchable, but not in the flip board.
+
+    Guard against misleading percentage discounts on near-zero-value items.
+    Price is the total listing price, so evaluate cost per unit as well.
+    """
+    min_total = 4096  # One liquid emerald (LE), adjustable through an env var.
+    try:
+        min_total = max(0, int(os.getenv('WYNNFLIP_MIN_LEAD_PRICE_E', '4096')))
+    except ValueError:
+        pass
+    for item in items:
+        price = number(item.get('price_e')) or 0
+        qty = number(item.get('quantity')) or 1
+        per_unit = price / max(1, qty)
+        name = str(item.get('name', '')).casefold().strip()
+        trivial = price < min_total or per_unit <= 64
+        # Common bulk consumable: even a large stack doesn't merit an
+        # apparent flip derived from an inflated aggregate price reference.
+        if name in {'corkian amplifier i', 'corkian amplifier 1', 'corkian amplifier 1s'}:
+            trivial = True
+        if trivial:
+            item['low_value_filtered'] = True
+            item['low_value_reason'] = (
+                'Low-value or bulk item: hidden from opportunities; still in Market Explorer.'
+            )
+            item['v12_signal'] = 'market'
+        else:
+            item['low_value_filtered'] = False
+    return items
+
+def apply_trade_costs(items):
+    """Estimate take-home sale proceeds and purchase cost in emeralds.
+
+    The wiki documents a 5% buyer-side market charge, rather than a
+    separate seller tax. A displayed buyer-inclusive sale price therefore
+    pays the seller approximately sale_price / 1.05. WynnVentory's price
+    representation isn't guaranteed, so the assumption is explicit and
+    configurable without changing the public API key or frontend.
+    """
+    fee = 0.05
+    # Default: WynnVentory prices represent displayed buyer-facing market
+    # prices. Set to 'false' only if verified to be untaxed seller asks.
+    prices_include_tax = os.getenv('WYNNFLIP_PRICES_INCLUDE_BUYER_TAX', 'true').strip().lower() not in ('0','false','no')
+    for item in items:
+        buy = number(item.get('price_e'))
+        fair = number(item.get('fair_e'))
+        item['market_buyer_fee_pct'] = 5.0
+        item['price_assumption'] = 'buyer_inclusive' if prices_include_tax else 'seller_ask'
+        item['purchase_total_e'] = (round(buy) if prices_include_tax else round(buy * (1 + fee))) if buy and buy > 0 else None
+        if item.get('valuation_source') == 'roll_comparables' and fair and buy and buy > 0:
+            # If the reference includes the fee charged to the resale buyer,
+            # subtract that fee to estimate what the seller receives.
+            resale_take_home = round(fair / (1 + fee)) if prices_include_tax else round(fair)
+            purchase_total = item['purchase_total_e']
+            possible = resale_take_home - purchase_total
+            item['resale_estimate_e'] = round(fair)
+            item['resale_take_home_e'] = resale_take_home
+            item['selling_transaction_fee_e'] = max(0, round(fair) - resale_take_home) if prices_include_tax else 0
+            item['potential_net_profit_e'] = possible
+            item['potential_net_roi_pct'] = round(100 * possible / purchase_total, 1) if purchase_total else None
+            item['price_kind'] = 'conservative_roll_asking_reference'
+            if possible <= 0 or (item['potential_net_roi_pct'] is not None and item['potential_net_roi_pct'] < 25):
+                if item.get('v12_signal') == 'roll_opportunity':
+                    item['v12_signal'] = 'market'
+        else:
+            item['potential_net_profit_e'] = None
+            item['potential_net_roi_pct'] = None
+            item['resale_estimate_e'] = None
+            item['resale_take_home_e'] = None
+            item['selling_transaction_fee_e'] = None
+            item['price_kind'] = 'baseline_only' if fair else 'unknown'
+    return items
+
 def fetch_market(key,session=None,limit_pages=2,page_size=100):
     session=session or requests.Session();rows=[];pages=None
     for page in range(1,limit_pages+1):
@@ -196,7 +310,7 @@ def fetch_market(key,session=None,limit_pages=2,page_size=100):
     if not rows:raise ValueError('No market listings returned')
     now=datetime.now(timezone.utc)
     reference=snapshot(session)
-    stored=load_history()
+    stored,history_read_error=load_history()
     # Bounded historical distinct observations, stored as explicit comparison-only data.
     prior=stored.get('observations',{}) if isinstance(stored.get('observations'),dict) else {}
     historical_rows=list(prior.values())[:3000]
@@ -207,23 +321,27 @@ def fetch_market(key,session=None,limit_pages=2,page_size=100):
     n_lookup=0
     n_baseline,n_lookup=apply_baselines(items,bases,session,key)
     augment(items,reference+historical_rows)
-    # Update durable history only when Redis is configured, up to 3,000 unique offers.
-    durable=bool(os.environ.get('UPSTASH_REDIS_REST_URL') and os.environ.get('UPSTASH_REDIS_REST_TOKEN'))
-    if durable:
-        for r in rows:
-            p=number(r.get('listing_price'))
-            if not r.get('name') or not p or p<=0:continue
-            ident=str(r.get('hash_code') or (str(r.get('name'))+str(p)+str(r.get('timestamp'))))
-            if ident not in prior:prior[ident]={'name':r['name'],'listing_price':p,'tier':r.get('tier'),
-                  'stat_rolls':r.get('stat_rolls') if isinstance(r.get('stat_rolls'),dict) else {},'hash_code':ident,
-                  'timestamp':r.get('timestamp')}
-        prior=dict(list(prior.items())[-3000:])
-        persist_history({'observations':prior})
+    configured=bool(os.environ.get('UPSTASH_REDIS_REST_URL') and os.environ.get('UPSTASH_REDIS_REST_TOKEN'))
+    saved_count=None;history_write_error=None
+    if configured:
+        saved_count,history_write_error=persist_history(rows)
+    # Enabled means Redis acknowledged the write; merely having environment
+    # variables configured is not sufficient evidence that history works.
+    durable=configured and saved_count is not None and history_read_error is None
+    if saved_count is not None:
+        history_total=saved_count
+    else:
+        history_total=len(prior)
+    apply_trade_costs(items)
+    suppress_trivial_leads(items)
     items.sort(key=lambda x:x.get('listing_age_minutes') if x.get('listing_age_minutes') is not None else 1e10)
     return {'status':{'version':'12','updated_at':now.isoformat(),'scanned':len(rows),'exported':len(items),
-       'reference_offers':len(reference),'durable_history_offers':len(prior),'persistent_history':durable,
+       'reference_offers':len(reference),'durable_history_offers':history_total,'persistent_history':durable,
+       'history_configured':configured,'history_read_error':history_read_error,
+       'history_write_error':history_write_error,
        'baseline_items':len(bases),'baseline_estimates':n_baseline,'baseline_source':source,
        'baseline_errors':errors,'individual_price_lookups':n_lookup,
+       'low_value_suppressed':sum(bool(i.get('low_value_filtered')) for i in items),
        'roll_opportunities':sum(i.get('v12_signal')=='roll_opportunity' for i in items),
        'research_candidates':sum(i.get('v12_signal')=='research' for i in items),
        'matched_profiles':sum(bool(i.get('wynnpool')) for i in items),
