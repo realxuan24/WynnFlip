@@ -32,6 +32,8 @@ jobs:
         run: pip install -r requirements.txt
       - name: Test analysis
         run: python -m unittest discover -s tests -v
+      - name: Refresh permitted Wynnpool reference profiles
+        run: python scripts/import_weights.py
       - name: Scan market
         env:
           WYNNVENTORY_API_KEY: ${{ secrets.WYNNVENTORY_API_KEY }}
@@ -46,7 +48,7 @@ jobs:
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add data/ site/market.json
+          git add data/ site/market.json profiles/item_weights.json
           if ! git diff --cached --quiet; then
             git commit -m "Update WynnFlip market observations"
             git push
