@@ -1,5 +1,6 @@
 """WynnFlip V13.0: durable market observations and cached item baselines."""
 import os, time, json, statistics, threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from collections import defaultdict
 from datetime import datetime, timezone
 from pathlib import Path
@@ -386,10 +387,25 @@ def apply_baselines(items,baselines,session,key):
         if not name:continue
         if (name,'') not in baselines and not any(item.get('fair_e') for item in group):
             missing.append(name)
-    for name in missing[:12]:
-        record,_origin=cached_item_price(session,key,name)
-        lookups+=1
-        if record:baselines[(name,'')]=record
+    selected=missing[:12]
+    # Independent per-item requests (including independent Redis cache lookups).
+    # Use a separate Session per worker; do not share requests.Session across threads.
+    def price_worker(name):
+        with requests.Session() as worker_session:
+            return cached_item_price(worker_session,key,name)[0]
+    if selected:
+        with ThreadPoolExecutor(max_workers=min(4,len(selected))) as executor:
+            tasks={executor.submit(price_worker,name):name for name in selected}
+            results={}
+            for future in as_completed(tasks):
+                name=tasks[future]
+                # cached_item_price already handles unavailable upstream data, but
+                # a failed optional lookup must not abort a successful market scan.
+                try:results[name]=future.result()
+                except (requests.RequestException,ValueError,TypeError):results[name]=None
+        for name in selected:
+            lookups+=1
+            if results.get(name):baselines[(name,'')]=results[name]
     for item in items:
         if item.get('fair_e') is not None:
             item['valuation_source']='roll_comparables' if item.get('identification_status')=='identified' else 'unid_comparables' if item.get('identification_status')=='unidentified' else 'unknown';
@@ -774,12 +790,33 @@ def mark_observation_freshness(items, now):
 
 
 def fetch_market(key,session=None,limit_pages=5,page_size=100):
+    started=time.perf_counter()
+    timings={}
     session=session or requests.Session();rows=[];pages=None
-    for page in range(1,limit_pages+1):
-        data=get_json(session,BASE+'/api/v2/market/listings',key,
-         {'page':page,'page_size':page_size,'sort':'timestamp_desc'},timeout=12)
-        batch,pages=extract_listing_page(data);rows.extend(batch)
-        if len(batch)<page_size or (pages is not None and page>=int(pages)):break
+    # Discover page count from the first response. Only fetch the remaining
+    # bounded pages concurrently; assemble them in original page order.
+    data=get_json(session,BASE+'/api/v2/market/listings',key,
+         {'page':1,'page_size':page_size,'sort':'timestamp_desc'},timeout=12)
+    first,pages=extract_listing_page(data)
+    rows.extend(first)
+    if len(first)>=page_size and (pages is None or int(pages)>1) and limit_pages>1:
+        last_page=min(limit_pages,int(pages)) if pages is not None else limit_pages
+        def listing_worker(page):
+            with requests.Session() as worker_session:
+                response=get_json(worker_session,BASE+'/api/v2/market/listings',key,
+                     {'page':page,'page_size':page_size,'sort':'timestamp_desc'},timeout=12)
+                batch,_=extract_listing_page(response)
+                return batch
+        with ThreadPoolExecutor(max_workers=min(4,last_page-1)) as executor:
+            futures={executor.submit(listing_worker,p):p for p in range(2,last_page+1)}
+            batches={}
+            for future in as_completed(futures):
+                batches[futures[future]]=future.result()
+        for page in range(2,last_page+1):
+            batch=batches[page]
+            rows.extend(batch)
+            if len(batch)<page_size:break
+    timings['listings']=round(time.perf_counter()-started,2)
     rows = deduplicate_recent(rows)
     if not rows:raise ValueError('No market listings returned')
     now=datetime.now(timezone.utc)
@@ -787,6 +824,7 @@ def fetch_market(key,session=None,limit_pages=5,page_size=100):
     complete_scan=bool((pages is not None and page>=int(pages)) or len(batch)<page_size)
     reference=snapshot(session)
     stored,history_read_error=load_history()
+    timings['reference_and_history']=round(time.perf_counter()-started-sum(timings.values()),2)
     # Bounded historical distinct observations, stored as explicit comparison-only data.
     prior=stored.get('observations',{}) if isinstance(stored.get('observations'),dict) else {}
     historical_rows=list(prior.values())[:8000]
@@ -808,6 +846,7 @@ def fetch_market(key,session=None,limit_pages=5,page_size=100):
     bases=dict(bases)
     n_lookup=0
     n_baseline,n_lookup=apply_baselines(items,bases,session,key)
+    timings['valuation_and_price_lookups']=round(time.perf_counter()-started-sum(timings.values()),2)
     if configured and n_lookup and not index_write_error:
         index_write_error = save_cached_price_index(bases)
     matched_baselines=apply_status_matched_base_references(items,rows+reference+historical_rows)
@@ -843,7 +882,9 @@ def fetch_market(key,session=None,limit_pages=5,page_size=100):
         if lifecycle_read_error is None:
             lifecycle_metrics=lifecycle_summary(items,lifecycle_entries,now,complete_scan)
     items.sort(key=lambda x:x.get('listing_age_minutes') if x.get('listing_age_minutes') is not None else 1e10)
-    return {'status':{'version':'15.0','updated_at':now.isoformat(),'scanned':len(rows),'exported':len(items),
+    timings['history_and_lifecycle']=round(time.perf_counter()-started-sum(timings.values()),2)
+    timings['total']=round(time.perf_counter()-started,2)
+    return {'status':{'version':'15.1','scan_timings_seconds':timings,'updated_at':now.isoformat(),'scanned':len(rows),'exported':len(items),
        'recent_observations':sum(i.get('observation_freshness')=='recent' for i in items),
        'verification_needed':sum(i.get('observation_freshness')=='verify' for i in items),
        'stale_or_unknown':sum(i.get('observation_freshness') in ('stale','unknown') for i in items),
@@ -960,7 +1001,7 @@ def lootpool():
 
 @app.get('/api/health')
 def health():
-    return {'version':'15.0','key_configured':bool(os.getenv('WYNNVENTORY_API_KEY')),
+    return {'version':'15.1','key_configured':bool(os.getenv('WYNNVENTORY_API_KEY')),
             'persistent_history_configured':bool(os.getenv('UPSTASH_REDIS_REST_URL') and os.getenv('UPSTASH_REDIS_REST_TOKEN'))}
 
 @app.get('/api/market')
