@@ -29,9 +29,21 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements.txt
 
+
+      - name: Check API key
+        env:
+          WYNNVENTORY_API_KEY: ${{ secrets.WYNNVENTORY_API_KEY }}
+        run: |
+          if [ -z "$WYNNVENTORY_API_KEY" ]; then
+            echo "ERROR: API key is missing"
+            exit 1
+          else
+            echo "SUCCESS: API key is configured"
+          fi
+
       - name: Run market scanner
         env:
-          WYNNVENTORY_API_KEY: ${<escape>{ secrets.WYNNVENTORY_API_KEY }</escape>}
+          WYNNVENTORY_API_KEY: ${{ secrets.WYNNVENTORY_API_KEY }}
         run: python scanner.py
 
       - name: Save results
