@@ -391,6 +391,48 @@ def lifecycle_summary(items,entries,now,complete):
             'entries_7d':sum(0<=current-float(number(e.get('first_seen')) or 0)<=7*86400 for e in entries.values() if isinstance(e,dict)),
             'reobserved':sum(int(number(e.get('scans_seen')) or 0)>=2 for e in entries.values() if isinstance(e,dict))}
 
+def liquidity_evidence(item):
+    """Cautious liquidity-risk assessment; no absence/sale or time-to-sale inference.
+
+    Historical lifetimes are lower bounds on observed presence, not sale durations.
+    All activity by name aggregates different rolls and must be labeled as such.
+    """
+    l=item.get('lifecycle') or {}
+    m=item.get('sellability') or {}
+    tracked=int(number(l.get('new_listings_30d')) or 0)
+    repeated=int(number(l.get('reobserved_listings')) or 0)
+    persistent=int(number(l.get('persistent_listings')) or 0)
+    reductions=int(number(l.get('price_reductions')) or 0)
+    hours=number(l.get('longest_observed_hours'))
+    cheaper=int(number(m.get('cheaper_asks')) or 0)
+    # Only mark a higher-risk market when meaningful persistent inventory or
+    # competitor evidence is present. Never award a 'fast selling' label.
+    enough=tracked>=5 and repeated>=3
+    high_competition=cheaper>=4
+    persistent_concern=bool(hours is not None and hours>=48 and persistent>=3)
+    repricing_concern=bool(reductions>=3 and repeated>=5)
+    if high_competition or (enough and (persistent_concern or repricing_concern)):
+        label='Higher resale risk'
+        reasons=[]
+        if high_competition:reasons.append(f'{cheaper} significantly cheaper competing asks')
+        if persistent_concern:reasons.append(f'{persistent} listings repeatedly seen; longest observed span {hours:.1f}h')
+        if repricing_concern:reasons.append(f'{reductions} observed asking-price reductions')
+    elif enough:
+        label='Some liquidity evidence'
+        reasons=[f'{tracked} distinct IDs tracked over 30d; {repeated} reobserved']
+        if cheaper:reasons.append(f'{cheaper} cheaper competing asks')
+    else:
+        label='Insufficient liquidity evidence'
+        reasons=['Too few independently tracked listing IDs across scans']
+        if high_competition:reasons.append(f'{cheaper} cheaper competing asks')
+    return {'label':label,'confidence':('developing' if enough else 'insufficient'),
+            'reasons':reasons,'tracked_30d':tracked,'reobserved':repeated,
+            'persistent':persistent,'observed_price_reductions':reductions,
+            'longest_observed_hours':hours,'cheaper_competitors':cheaper,
+            'possible_removals':None,'confirmed_sales':None,'estimated_sale_hours':None,
+            'note':'Name-wide supply-side indicators, not buyer demand; incomplete scans cannot prove removals or sales.'}
+
+
 def apply_baselines(items,baselines,session,key):
     filled=0; lookups=0; groups=defaultdict(list)
     for item in items:groups[str(item.get('name','')).strip().casefold()].append(item)
@@ -904,6 +946,7 @@ def fetch_market(key,session=None,limit_pages=5,page_size=100):
     for item in items:
         item['v16_trend']=trends.get(str(item.get('name') or '').strip().casefold(), {'asking_price_trend':'insufficient'})
         item['v16_scenarios']=conservative_scenarios(item)
+        item['v161_liquidity']=liquidity_evidence(item)
     items.sort(key=lambda x:x.get('listing_age_minutes') if x.get('listing_age_minutes') is not None else 1e10)
     timings['total']=round(time.perf_counter()-started,2)
     return {'status':{'version':'16.0','scan_timings_seconds':timings,'updated_at':now.isoformat(),'scanned':len(rows),'exported':len(items),
