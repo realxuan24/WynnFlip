@@ -349,7 +349,7 @@ def apply_trade_costs(items):
             item['price_kind'] = 'baseline_only' if fair else 'unknown'
     return items
 
-def fetch_market(key,session=None,limit_pages=2,page_size=100):
+def fetch_market(key,session=None,limit_pages=5,page_size=100):
     session=session or requests.Session();rows=[];pages=None
     for page in range(1,limit_pages+1):
         data=get_json(session,BASE+'/api/v2/market/listings',key,
