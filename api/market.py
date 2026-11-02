@@ -192,14 +192,21 @@ local incoming=cjson.decode(ARGV[1])
 for id,value in pairs(incoming) do
   if obs[id]==nil then obs[id]=value end
 end
-local keyed={}
-for id,val in pairs(obs) do
-  table.insert(keyed,{id=id,t=tonumber(val.observed_at or 0) or 0})
+local count=0
+for _ in pairs(obs) do count=count+1 end
+-- A full 8,000-entry sort on every scan is expensive in Redis Lua.
+-- Keep the same oldest-first retention policy, but prune only at capacity.
+if count>8000 then
+  local keyed={}
+  for id,val in pairs(obs) do
+    table.insert(keyed,{id=id,t=tonumber(val.observed_at or 0) or 0})
+  end
+  table.sort(keyed,function(a,b) if a.t==b.t then return a.id<b.id else return a.t>b.t end end)
+  for j=8001,#keyed do obs[keyed[j].id]=nil end
+  count=8000
 end
-table.sort(keyed,function(a,b) if a.t==b.t then return a.id<b.id else return a.t>b.t end end)
-for j=8001,#keyed do obs[keyed[j].id]=nil end
 redis.call('SET',KEYS[1],cjson.encode(current))
-return math.min(#keyed,8000)
+return count
 """
 
 def persist_history(rows):
@@ -258,15 +265,21 @@ if complete then
     end
   end
 end
-local ordered={}
-for id,v in pairs(entries) do
-  table.insert(ordered,{id=id,t=tonumber(v.last_seen or 0)})
+local count=0
+for _ in pairs(entries) do count=count+1 end
+-- Sorting is only required when the 12,000-ID lifecycle store overflows.
+if count>12000 then
+  local ordered={}
+  for id,v in pairs(entries) do
+    table.insert(ordered,{id=id,t=tonumber(v.last_seen or 0) or 0})
+  end
+  table.sort(ordered,function(a,b) if a.t==b.t then return a.id<b.id else return a.t>b.t end end)
+  for i=12001,#ordered do entries[ordered[i].id]=nil end
+  count=12000
 end
-table.sort(ordered,function(a,b) if a.t==b.t then return a.id<b.id else return a.t>b.t end end)
-for i=12001,#ordered do entries[ordered[i].id]=nil end
 old.updated_at=now
 redis.call('SET',KEYS[1],cjson.encode(old),'EX',86400*45)
-return cjson.encode({new_count=new_count,repeat_count=repeat_count,tracked=math.min(#ordered,12000)})
+return cjson.encode({new_count=new_count,repeat_count=repeat_count,tracked=count})
 """
 
 def lifecycle_identifier(row):
@@ -852,21 +865,8 @@ def fetch_market(key,session=None,limit_pages=5,page_size=100):
     matched_baselines=apply_status_matched_base_references(items,rows+reference+historical_rows)
     augment(items,reference+historical_rows)
     configured=bool(os.environ.get('UPSTASH_REDIS_REST_URL') and os.environ.get('UPSTASH_REDIS_REST_TOKEN'))
-    saved_count=None;history_write_error=None
-    if configured:
-        saved_count,history_write_error=persist_history(rows)
-    # Enabled means Redis acknowledged the write; merely having environment
-    # variables configured is not sufficient evidence that history works.
-    durable=configured and saved_count is not None and history_read_error is None
-    if saved_count is not None:
-        history_total=saved_count
-    else:
-        history_total=len(prior)
-    apply_trade_costs(items)
-    tentative_count=add_tentative_price_ranges(items,rows+reference+historical_rows)
-    suppress_trivial_leads(items)
-    assess_sellability(items,rows,reference+historical_rows)
-    mark_observation_freshness(items,now)
+    # Independent Redis writes can run concurrently. Lifecycle updates need
+    # only their own listing-ID feed, not the price-history write result.
     lifecycle_rows=rows
     lifecycle_source="v2 market listings"
     if configured and not lifecycle_input(rows):
@@ -876,15 +876,33 @@ def fetch_market(key,session=None,limit_pages=5,page_size=100):
     lifecycle_entries={}
     lifecycle_read_error=None
     lifecycle_metrics={'tracked_items':0,'entries_7d':0,'entries_30d':0,'reobserved':0,'price_changes':0,'price_reductions':0,'persistent':0}
+    saved_count=None
+    history_write_error=None
+    def lifecycle_work():
+        counts,error,_=update_lifecycle(lifecycle_rows,False,now.timestamp())
+        entries,read_error=read_lifecycle()
+        return counts,error,entries,read_error
+    history_start=time.perf_counter()
     if configured:
-        lifecycle_counts,lifecycle_write_error,_=update_lifecycle(lifecycle_rows,False,now.timestamp())
-        lifecycle_entries,lifecycle_read_error=read_lifecycle()
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            history_future=executor.submit(persist_history,rows)
+            lifecycle_future=executor.submit(lifecycle_work)
+            saved_count,history_write_error=history_future.result()
+            lifecycle_counts,lifecycle_write_error,lifecycle_entries,lifecycle_read_error=lifecycle_future.result()
         if lifecycle_read_error is None:
             lifecycle_metrics=lifecycle_summary(items,lifecycle_entries,now,complete_scan)
+    timings['history_and_lifecycle']=round(time.perf_counter()-history_start,2)
+    # Enabled means Redis acknowledged the write, not just that keys exist.
+    durable=configured and saved_count is not None and history_read_error is None
+    history_total=saved_count if saved_count is not None else len(prior)
+    apply_trade_costs(items)
+    tentative_count=add_tentative_price_ranges(items,rows+reference+historical_rows)
+    suppress_trivial_leads(items)
+    assess_sellability(items,rows,reference+historical_rows)
+    mark_observation_freshness(items,now)
     items.sort(key=lambda x:x.get('listing_age_minutes') if x.get('listing_age_minutes') is not None else 1e10)
-    timings['history_and_lifecycle']=round(time.perf_counter()-started-sum(timings.values()),2)
     timings['total']=round(time.perf_counter()-started,2)
-    return {'status':{'version':'15.1','scan_timings_seconds':timings,'updated_at':now.isoformat(),'scanned':len(rows),'exported':len(items),
+    return {'status':{'version':'15.2','scan_timings_seconds':timings,'updated_at':now.isoformat(),'scanned':len(rows),'exported':len(items),
        'recent_observations':sum(i.get('observation_freshness')=='recent' for i in items),
        'verification_needed':sum(i.get('observation_freshness')=='verify' for i in items),
        'stale_or_unknown':sum(i.get('observation_freshness') in ('stale','unknown') for i in items),
@@ -1001,7 +1019,7 @@ def lootpool():
 
 @app.get('/api/health')
 def health():
-    return {'version':'15.1','key_configured':bool(os.getenv('WYNNVENTORY_API_KEY')),
+    return {'version':'15.2','key_configured':bool(os.getenv('WYNNVENTORY_API_KEY')),
             'persistent_history_configured':bool(os.getenv('UPSTASH_REDIS_REST_URL') and os.getenv('UPSTASH_REDIS_REST_TOKEN'))}
 
 @app.get('/api/market')
