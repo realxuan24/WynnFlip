@@ -1,4 +1,4 @@
-"""WynnFlip V5: scheduled, read-only WynnVentory market observer.
+"""WynnFlip V8: GitHub-only, read-only WynnVentory market observer.
 Listing presence is NOT proof of in-game availability.
 """
 import hashlib
@@ -98,13 +98,43 @@ def age_minutes(value, now):
     return max(0, round((now - dt).total_seconds() / 60, 1)) if dt else None
 
 
+def exact_ids(row):
+    """Normalize WynnVentory nested stat_rolls; preserve actual in-game ID values."""
+    raw = row.get('stat_rolls') or {}
+    entries = []
+    if isinstance(raw, list):
+        source = [(None, e) for e in raw]
+    elif isinstance(raw, dict):
+        source = list(raw.items())
+    else:
+        return []
+    for key, entry in source:
+        if isinstance(entry, dict):
+            stat = entry.get('statActualValue') or {}
+            stat_type = stat.get('statType') or {}
+            name = entry.get('displayName') or stat_type.get('displayName') or key
+            api = entry.get('apiName') or stat_type.get('apiName') or key or name
+            actual = number(entry.get('statRoll'))
+            if actual is None: actual = number(stat.get('value'))
+            pct = number(entry.get('rollPercentage'))
+            if pct is not None and not 0 <= pct <= 100: pct = None
+            possible = entry.get('possibleValues') or {}
+            span = entry.get('statRange') or possible.get('range') or {}
+            fixed = bool(span.get('fixed',False)) or span.get('low') == span.get('high')
+            unit = entry.get('unit') or stat_type.get('unit') or ''
+        else:
+            name, api, actual, pct, fixed, unit = key, key, number(entry), number(entry), False, ''
+            if pct is not None and not 0 <= pct <= 100: pct = None
+        if not name or actual is None: continue
+        entries.append({'name':str(name),'api_name':str(api or name),'value':actual,
+                        'roll_pct':None if fixed else pct,'fixed':bool(fixed),'unit':str(unit)})
+    return entries
+
+
 def roll_numbers(row):
-    """Numeric individual roll fields; reject malformed roll payloads."""
-    rolls = row.get('stat_rolls') or {}
-    if not isinstance(rolls, dict):
-        return {}
-    return {str(k): v for k, raw in rolls.items()
-            if (v := number(raw)) is not None and abs(v) <= 100000}
+    """Return valid percentage rolls by canonical API ID name."""
+    return {x['api_name']:x['roll_pct'] for x in exact_ids(row)
+            if x['roll_pct'] is not None and not x['fixed']}
 
 
 def rank_correlation(pairs):
@@ -269,10 +299,15 @@ def estimate(row, peers, historical, id_weights=None, id_evidence=None, profile=
     high_risk=dispersion>.35 or (volatility is not None and volatility >= .12)
     # Do not call a listing a strong candidate based solely on asking prices.
     # Genuine buyer demand / completed transactions are not verified.
-    if False and profit > 0 and roi >= 25 and conf >= .45 and len(past)>=3 and not high_risk:
-        category='candidate'
+    # No confirmed-sale feed exists, so never declare an item a guaranteed buy.
+    # Require roll-matched comparable offers AND meaningful headroom before 'potential'.
+    competing_cheaper = sum(1 for v, _ in comps if v <= fair)
+    strict_evidence = bool(profile and len(comps) >= 7 and conf >= .50 and
+                           len(past) >= 3 and not high_risk and competing_cheaper <= 2)
+    if profit > 0 and roi >= 25 and strict_evidence:
+        category='potential'
     elif profit > 0 and roi >= 15:
-        category='watch' if high_risk or profile is None else 'potential'
+        category='watch'
     else:
         category='unrated'
     score=max(0,profit)/LE * max(0,roi/100)**.5 * conf * (1-min(.8,dispersion)) * (1-min(.8,(volatility or .07)*3))
@@ -280,10 +315,12 @@ def estimate(row, peers, historical, id_weights=None, id_evidence=None, profile=
     if len(past)<3: warnings.append('Limited history')
     if high_risk: warnings.append('Unstable comparable prices')
     if len(comps)<7: warnings.append('Few comparable listings')
+    if competing_cheaper>2: warnings.append('Multiple competing listings at or below conservative resale estimate')
     if not profile: warnings.append('Wynnpool profile unavailable or roll format unverified')
     warnings.append('Buyer demand and completed sales unverified')
     return dict(fair_e=fair,profit_e=profit,roi=round(roi,1),confidence=round(conf,3),
                 category=category,score=round(score,3),comparables=len(comps),
+                cheaper_competitors=competing_cheaper, resale_evidence='unverified',
                 volatility=round(volatility,4) if volatility is not None else None,
                 stability='volatile' if high_risk else ('unknown' if len(past)<3 else 'stable'),
                 warnings=warnings, id_pricing={'method':'listing-price association only',
@@ -316,16 +353,22 @@ def build(listings, previous, history, now, profiles=None):
             item=dict(id=ident,name=r.get('name'),rarity=r.get('tier') or '',
                       item_type=r.get('item_type') or '',subtype=r.get('subtype') or '',
                       quantity=r.get('amount') or 1,price_e=price_e(r),
-                      stat_rolls=r.get('stat_rolls') or {},overall_roll=r.get('overall_roll'),
+                      stat_rolls=roll_numbers(r),exact_ids=exact_ids(r),overall_roll=r.get('overall_roll'),
                       first_seen=first,last_observed=last,
                       listing_timestamp=r.get('timestamp'),listing_age_minutes=listing_age,
                       observed_age_minutes=observation_age,
                       category='unrated',fair_e=None,profit_e=None,roi=None,score=0,
                       id_pricing={'method':'insufficient evidence','weighted_ids':[],'verified_sales':False},
                       wynnpool=profile,
-                      confidence=None,stability='unknown',warnings=[])
+                      confidence=None,stability='unknown',warnings=[],
+                      comparables=0,cheaper_competitors=None,resale_evidence='unverified')
             if analysis: item.update(analysis)
             item['wynnpool']=profile
+            item['meta']={'profile_source':'community weights (if matched)',
+                          'build_relevance':'profile-supported' if profile else 'unverified',
+                          'profile_verified_current_patch':False}
+            item['demand']={'level':'unknown', 'verified_sales':0,
+                            'reason':'No verified completed-sale feed; partial market scans cannot establish turnover.'}
             # Without a trustworthy listing timestamp, freshness cannot be asserted.
             if listing_age is None:
                 item['freshness']='unknown'
@@ -382,14 +425,14 @@ def main():
         loot={'state':'available','data':pool}
     except (requests.RequestException,ValueError) as err:
         loot['note']=f'Lootpool lookup unavailable ({type(err).__name__})'
-    status={'version':'6','updated_at':now.isoformat(),'scanned':len(rows),'exported':len(output),
-            'pages':page,'total_pages':total_pages,
+    status={'version':'8','updated_at':now.isoformat(),'scanned':len(rows),'exported':len(output),
+            'pages':page,'total_pages':total_pages,'matched_profiles':sum(bool(x.get('wynnpool')) for x in output),
             'complete':bool((total_pages and page>=int(total_pages)) or len(items)<page_size),
             'note':'Observed API listings, not confirmed in-game availability; timestamps may be missing.'}
     save(DATA/'observed.json', {'listings':seen})
     save(DATA/'history_v4.json',history)
     save(SITE/'market.json',{'status':status,'listings':output,'lootpool':loot})
-    print('Scan OK V6:',status['scanned'],'observed;',len(output),'exported;',status['complete'],'complete')
+    print('Scan OK V8:',status['scanned'],'observed;',len(output),'exported;',status['complete'],'complete')
 
 
 if __name__ == '__main__':main()
