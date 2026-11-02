@@ -843,7 +843,7 @@ def fetch_market(key,session=None,limit_pages=5,page_size=100):
         if lifecycle_read_error is None:
             lifecycle_metrics=lifecycle_summary(items,lifecycle_entries,now,complete_scan)
     items.sort(key=lambda x:x.get('listing_age_minutes') if x.get('listing_age_minutes') is not None else 1e10)
-    return {'status':{'version':'14.2','updated_at':now.isoformat(),'scanned':len(rows),'exported':len(items),
+    return {'status':{'version':'15.0','updated_at':now.isoformat(),'scanned':len(rows),'exported':len(items),
        'recent_observations':sum(i.get('observation_freshness')=='recent' for i in items),
        'verification_needed':sum(i.get('observation_freshness')=='verify' for i in items),
        'stale_or_unknown':sum(i.get('observation_freshness') in ('stale','unknown') for i in items),
@@ -884,9 +884,83 @@ def fetch_market(key,session=None,limit_pages=5,page_size=100):
        'notes':'Lifecycle counts are observations, not sales. Incomplete scans never imply a listing disappeared.'},
        'listings':items}
 
+
+# V15 lootrun intelligence runs independently of the market scan and pricing keys.
+def pool_names(payload):
+    """Extract only explicit item-name fields; do not mistake regions for items.
+
+    WynnVentory's documentation does not promise one fixed processed JSON shape.
+    Return sorted names and an extraction confidence flag.
+    """
+    names=set()
+    def walk(value, depth=0, item_context=False):
+        if depth>9:return
+        if isinstance(value,list):
+            for v in value[:3000]:walk(v,depth+1,item_context)
+        elif isinstance(value,dict):
+            for k in ('name','item_name','itemName'):
+                name=value.get(k)
+                if isinstance(name,str) and 1<len(name)<90 and name.strip():
+                    # Require a plausible item descriptor, not a region/week label.
+                    if any(t in value for t in ('rarity','type','item_type','itemType','amount','quantity','tier','category')) or item_context:
+                        names.add(name.strip())
+            for key,v in value.items():
+                if key in ('name','item_name','itemName','description','lore','icon','timestamp','date','created_at'):
+                    continue
+                if isinstance(v,(dict,list)):
+                    walk(v,depth+1,item_context or key in ('items','rewards','mythics','lootpool_items','lootPoolItems'))
+    walk(payload)
+    return sorted(names,key=str.casefold)
+
+def lootpool_fetch(session,key):
+    now=datetime.now(timezone.utc)
+    week=now.isocalendar()
+    result={'version':'15.0','iso_year':week.year,'iso_week':week.week,'updated_at':now.isoformat(),
+            'available':False,'items':[],'added':[],'removed':[],
+            'source':'WynnVentory weekly lootpool','error':None,'historical_comparison':'unavailable',
+            'warning':'Lootpool presence indicates potential incoming supply, not sales or future prices.'}
+    if not key:
+        result['error']='WYNNVENTORY_API_KEY is not configured';return result
+    headers={'X-API-Key':key}
+    def read(path):
+        r=session.get(BASE+path,headers=headers,timeout=8)
+        if r.status_code in (401,403):return None,'Missing read:lootpool permission (HTTP '+str(r.status_code)+')'
+        if r.status_code==404:return None,'Lootpool data not published for this week'
+        r.raise_for_status()
+        return r.json(),None
+    try:
+        current,error=read('/api/lootpool/items')
+        if error:
+            result['error']=error;return result
+        names=pool_names(current)
+        if not names:
+            result['error']='No recognisable item names in lootpool response (format may differ)'
+            return result
+        result.update(available=True,items=names,source='WynnVentory processed current lootpool')
+        # Historical comparison is optional and must never compromise the current-week view.
+        previous=now.date().fromordinal(now.date().toordinal()-7).isocalendar()
+        old,old_error=read('/api/lootpool/'+str(previous.year)+'/'+str(previous.week))
+        if old_error is None:
+            old_names=pool_names(old)
+            if old_names:
+                cur={x.casefold():x for x in names}; prior={x.casefold():x for x in old_names}
+                result['added']=[cur[k] for k in sorted(cur.keys()-prior.keys())]
+                result['removed']=[prior[k] for k in sorted(prior.keys()-cur.keys())]
+                result['historical_comparison']='previous week compared'
+            else:result['historical_comparison']='previous week format unknown'
+        else:result['historical_comparison']=old_error
+    except (requests.RequestException,ValueError,TypeError) as e:
+        result['error']='Lootpool feed failed ('+type(e).__name__+')'
+    return result
+
+@app.get('/api/lootpool')
+def lootpool():
+    key=os.environ.get('WYNNVENTORY_API_KEY','')
+    return cached('v15:lootpool',600,lambda:lootpool_fetch(requests.Session(),key))
+
 @app.get('/api/health')
 def health():
-    return {'version':'14.2','key_configured':bool(os.getenv('WYNNVENTORY_API_KEY')),
+    return {'version':'15.0','key_configured':bool(os.getenv('WYNNVENTORY_API_KEY')),
             'persistent_history_configured':bool(os.getenv('UPSTASH_REDIS_REST_URL') and os.getenv('UPSTASH_REDIS_REST_TOKEN'))}
 
 @app.get('/api/market')
