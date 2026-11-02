@@ -1,4 +1,4 @@
-"""WynnFlip V12. Market facts are asking prices, not recorded sales."""
+"""WynnFlip V13.0: durable market observations and cached item baselines."""
 import os, time, json, statistics, threading
 from collections import defaultdict
 from datetime import datetime, timezone
@@ -66,6 +66,52 @@ def index_data(session,key):
                 errors.append(url.split('/')[-1]+': '+type(e).__name__)
         return {},'unavailable',errors
     return cached('index',1200,work)
+
+PRICE_INDEX_KEY = 'wynnflip:v13:price_index'
+
+def read_cached_price_index():
+    result, error = redis_call([['GET', PRICE_INDEX_KEY]])
+    if error:
+        return {}, None, error
+    try:
+        doc = json.loads(result[0]) if result and result[0] else {}
+        if not isinstance(doc, dict) or not isinstance(doc.get('entries'), dict):
+            return {}, None, None
+        entries = {}
+        for raw_key, value in doc['entries'].items():
+            if isinstance(value, dict) and number(value.get('price')) and '\x1f' in raw_key:
+                name, tier = raw_key.split('\x1f', 1)
+                entries[(name, tier)] = value
+        return entries, float(doc.get('updated_at') or 0), None
+    except (TypeError, ValueError):
+        return {}, None, 'invalid price index cache'
+
+def save_cached_price_index(entries):
+    # Replaces only the price index key; never touches the user's market history.
+    safe = {str(k[0])+'\x1f'+str(k[1]): v for k, v in entries.items()
+            if isinstance(k, tuple) and isinstance(v, dict) and number(v.get('price'))}
+    payload = json.dumps({'updated_at': time.time(), 'entries': safe}, separators=(',', ':'))
+    result, error = redis_call([['SET', PRICE_INDEX_KEY, payload, 'EX', 86400 * 7]])
+    return error
+
+def item_price_key(name):
+    # Names are normalized; no identification status is inferred for API-level aggregates.
+    return 'wynnflip:v13:item_price:' + quote(str(name).casefold().strip(), safe='')
+
+def cached_item_price(session, key, name):
+    k = item_price_key(name)
+    result, err = redis_call([['GET', k]]) if os.getenv('UPSTASH_REDIS_REST_URL') else (None, 'not configured')
+    if not err and result and result[0]:
+        try:
+            record = json.loads(result[0])
+            if isinstance(record, dict) and number(record.get('price')):
+                return record, 'redis'
+        except (TypeError, ValueError):
+            pass
+    record = per_item(session, key, name)
+    if record and not err:
+        redis_call([['SET', k, json.dumps(record, separators=(',', ':')), 'EX', 86400]])
+    return record, 'upstream' if record else 'unavailable'
 
 def snapshot(session):
     def work():
@@ -137,9 +183,9 @@ for id,val in pairs(obs) do
   table.insert(keyed,{id=id,t=tonumber(val.observed_at or 0) or 0})
 end
 table.sort(keyed,function(a,b) if a.t==b.t then return a.id<b.id else return a.t>b.t end end)
-for j=3001,#keyed do obs[keyed[j].id]=nil end
+for j=8001,#keyed do obs[keyed[j].id]=nil end
 redis.call('SET',KEYS[1],cjson.encode(current))
-return math.min(#keyed,3000)
+return math.min(#keyed,8000)
 """
 
 def persist_history(rows):
@@ -165,8 +211,8 @@ def apply_baselines(items,baselines,session,key):
         if not name:continue
         if (name,'') not in baselines and not any(item.get('fair_e') for item in group):
             missing.append(name)
-    for name in missing[:8]:
-        record=per_item(session,key,name)
+    for name in missing[:12]:
+        record,_origin=cached_item_price(session,key,name)
         lookups+=1
         if record:baselines[(name,'')]=record
     for item in items:
@@ -330,6 +376,80 @@ def augment(items,reference):
         else:item['v12_signal']='market'
     return items
 
+def assess_sellability(items, recent_rows, history_rows):
+    """Observed market activity proxy, NOT buyer demand or confirmed sales.
+
+    Distinct listing identities prevent repeated scans inflating activity.
+    Penalizes thin markets, excessive cheaper competition and unstable asks.
+    Only compares the same item/status/variant when identifying competition.
+    """
+    reference = list(recent_rows) + list(history_rows)
+    groups = defaultdict(dict)
+    for r in reference:
+        status = identification_status(r)
+        if status not in ('identified', 'unidentified'):
+            continue
+        price = price_e(r)
+        if not price or price <= 0:
+            continue
+        key = (str(r.get('name') or '').strip().casefold(), status,
+               str(r.get('item_type') or '').strip().casefold(),
+               str(r.get('subtype') or '').strip().casefold(),
+               str(r.get('shiny_stat') or '').strip().casefold())
+        if not key[0]:
+            continue
+        groups[key][identity(r)] = float(price)
+    for item in items:
+        key = (str(item.get('name') or '').strip().casefold(),
+               item.get('identification_status'),
+               str(item.get('item_type') or '').strip().casefold(),
+               str(item.get('subtype') or '').strip().casefold(),
+               str(item.get('shiny_stat') or '').strip().casefold())
+        distinct = groups.get(key, {})
+        offers = sorted(distinct.values())
+        count = len(offers)
+        price = number(item.get('price_e')) or 0
+        cheaper = sum(1 for v in offers if v < price * .97) if price else 0
+        if count >= 4:
+            median = statistics.median(offers)
+            mad = statistics.median(abs(v - median) for v in offers)
+            dispersion = mad / median if median else 1
+        else:
+            dispersion = None
+        # More listings = better *observability*, not automatically stronger demand.
+        score = min(38, 11 * max(0, count - 1))
+        score += 22 if count >= 6 and dispersion is not None and dispersion < .25 else 0
+        score += 12 if count >= 4 and dispersion is not None and dispersion < .5 else 0
+        score -= min(40, cheaper * 10)
+        if dispersion is not None and dispersion > .6:
+            score -= 18
+        score = max(0, min(100, round(score)))
+        if count < 3:
+            label = 'Unknown / thin market'
+        elif cheaper >= 4 or (dispersion is not None and dispersion > .75):
+            label = 'High resale risk'
+        elif count >= 6 and cheaper <= 1 and dispersion is not None and dispersion < .3:
+            label = 'More active / stable asks'
+        else:
+            label = 'Uncertain demand'
+        item['sellability'] = {'score':score, 'label':label,
+            'unique_observed_offers':count,'cheaper_asks':cheaper,
+            'price_dispersion_pct':round(100*dispersion,1) if dispersion is not None else None,
+            'verified_sales':False,
+            'note':'Listings are offers; this cannot measure real sales or resale speed.'}
+        # Do not promote low-demand reference-only bargains as recommendations.
+        if item.get('v12_signal') in ('research','roll_opportunity'):
+            if label in ('Unknown / thin market','High resale risk'):
+                item['v13_recommendation'] = 'speculative'
+            elif label == 'More active / stable asks':
+                item['v13_recommendation'] = 'research_priority'
+            else:
+                item['v13_recommendation'] = 'speculative'
+        else:
+            item['v13_recommendation'] = 'market'
+    return items
+
+
 def suppress_trivial_leads(items):
     """Keep cheap/bulk listings searchable, but not in the flip board.
 
@@ -432,6 +552,47 @@ def add_tentative_price_ranges(items, historical_rows):
     return count
 
 
+def normalized_observation_time(value):
+    """Normalize API observation timestamps; do not assert in-game creation time."""
+    from scanner import timestamp as parse_timestamp
+    dt = parse_timestamp(value)
+    return dt.timestamp() if dt else None
+
+
+def deduplicate_recent(rows):
+    """Keep one record per listing ID, retaining the newest valid observation."""
+    from scanner import identity
+    selected = {}
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        key = identity(row)
+        stamp = normalized_observation_time(row.get('timestamp'))
+        if key not in selected or (stamp is not None and (selected[key][0] is None or stamp > selected[key][0])):
+            selected[key] = (stamp, row)
+    result = [v[1] for v in selected.values()]
+    result.sort(key=lambda row: (normalized_observation_time(row.get('timestamp')) is None,
+                                  -(normalized_observation_time(row.get('timestamp')) or 0)))
+    return result
+
+
+def mark_observation_freshness(items, now):
+    now_s = now.timestamp()
+    for item in items:
+        ts = normalized_observation_time(item.get('listing_timestamp'))
+        # Future timestamps indicate bad metadata, not an infinitely fresh listing.
+        if ts is None or ts > now_s + 90:
+            item['observation_freshness'] = 'unknown'
+            item['listing_age_minutes'] = None
+            item['eligible_fresh_opportunity'] = False
+            continue
+        age = max(0, (now_s - ts) / 60)
+        item['listing_age_minutes'] = round(age, 1)
+        item['observation_freshness'] = 'recent' if age <= 5 else 'verify' if age <= 15 else 'stale'
+        item['eligible_fresh_opportunity'] = age <= 5
+    return items
+
+
 def fetch_market(key,session=None,limit_pages=5,page_size=100):
     session=session or requests.Session();rows=[];pages=None
     for page in range(1,limit_pages+1):
@@ -439,21 +600,35 @@ def fetch_market(key,session=None,limit_pages=5,page_size=100):
          {'page':page,'page_size':page_size,'sort':'timestamp_desc'},timeout=12)
         batch,pages=extract_listing_page(data);rows.extend(batch)
         if len(batch)<page_size or (pages is not None and page>=int(pages)):break
+    rows = deduplicate_recent(rows)
     if not rows:raise ValueError('No market listings returned')
     now=datetime.now(timezone.utc)
     reference=snapshot(session)
     stored,history_read_error=load_history()
     # Bounded historical distinct observations, stored as explicit comparison-only data.
     prior=stored.get('observations',{}) if isinstance(stored.get('observations'),dict) else {}
-    historical_rows=list(prior.values())[:3000]
+    historical_rows=list(prior.values())[:8000]
     profiles=load_profiles(ROOT/'profiles/item_weights.json')
     items,_,_=build(rows,{'listings':{}},{},now,profiles,reference_rows=reference+historical_rows)
     unid_estimates=apply_unidentified_comparables(items,rows+reference+historical_rows)
-    bases,source,errors=index_data(session,key)
+    configured=bool(os.environ.get('UPSTASH_REDIS_REST_URL') and os.environ.get('UPSTASH_REDIS_REST_TOKEN'))
+    stored_bases, indexed_at, cache_error = read_cached_price_index() if configured else ({}, None, 'not configured')
+    if stored_bases and indexed_at and time.time() - indexed_at < 1200:
+        bases, source, errors = stored_bases, 'Redis item price index (fresh)', []
+        index_write_error = None
+    else:
+        fresh_bases, source, errors = index_data(session,key)
+        bases = dict(stored_bases)
+        bases.update(fresh_bases)
+        index_write_error = save_cached_price_index(bases) if configured and fresh_bases else None
+        if not fresh_bases and stored_bases:
+            source = 'Redis item price index (stale fallback)'
     bases=dict(bases)
     n_lookup=0
     n_baseline,n_lookup=apply_baselines(items,bases,session,key)
-    matched_baselines=apply_status_matched_base_references(items,reference+historical_rows)
+    if configured and n_lookup and not index_write_error:
+        index_write_error = save_cached_price_index(bases)
+    matched_baselines=apply_status_matched_base_references(items,rows+reference+historical_rows)
     augment(items,reference+historical_rows)
     configured=bool(os.environ.get('UPSTASH_REDIS_REST_URL') and os.environ.get('UPSTASH_REDIS_REST_TOKEN'))
     saved_count=None;history_write_error=None
@@ -469,15 +644,29 @@ def fetch_market(key,session=None,limit_pages=5,page_size=100):
     apply_trade_costs(items)
     tentative_count=add_tentative_price_ranges(items,rows+reference+historical_rows)
     suppress_trivial_leads(items)
+    assess_sellability(items,rows,reference+historical_rows)
+    mark_observation_freshness(items,now)
     items.sort(key=lambda x:x.get('listing_age_minutes') if x.get('listing_age_minutes') is not None else 1e10)
-    return {'status':{'version':'12','updated_at':now.isoformat(),'scanned':len(rows),'exported':len(items),
-       'reference_offers':len(reference),'durable_history_offers':history_total,'persistent_history':durable,
+    return {'status':{'version':'13.2','updated_at':now.isoformat(),'scanned':len(rows),'exported':len(items),
+       'recent_observations':sum(i.get('observation_freshness')=='recent' for i in items),
+       'verification_needed':sum(i.get('observation_freshness')=='verify' for i in items),
+       'stale_or_unknown':sum(i.get('observation_freshness') in ('stale','unknown') for i in items),
+       'newest_observation_age_minutes':min((i['listing_age_minutes'] for i in items if i.get('listing_age_minutes') is not None),default=None),
+       'reference_offers':len(reference),
+       'pricing_index_cached_items':len(bases),'pricing_index_read_error':cache_error,'pricing_index_write_error':index_write_error,'durable_history_offers':history_total,'persistent_history':durable,
        'history_configured':configured,'history_read_error':history_read_error,
        'history_write_error':history_write_error,
        'unidentified_resale_estimates':unid_estimates,'tentative_price_ranges':tentative_count,'baseline_items':len(bases),'baseline_estimates':n_baseline,'status_matched_base_estimates':matched_baselines,'baseline_source':source,
        'baseline_errors':errors,'individual_price_lookups':n_lookup,
+       'price_reference_coverage':sum(x.get('fair_e') is not None for x in items),
+       'price_reference_coverage_pct':round(100*sum(x.get('fair_e') is not None for x in items)/len(items),1) if items else 0,
+       'resale_coverage':sum(x.get('price_kind') in ('conservative_roll_asking_reference','unidentified_asking_reference') for x in items),
+       'tentative_range_coverage':sum(bool(x.get('tentative_range_e')) for x in items),
+       'no_price_evidence':sum(x.get('fair_e') is None and not x.get('tentative_range_e') for x in items),
        'low_value_suppressed':sum(bool(i.get('low_value_filtered')) for i in items),
        'roll_opportunities':sum(i.get('v12_signal')=='roll_opportunity' for i in items),
+       'research_priority':sum(i.get('v13_recommendation')=='research_priority' and not i.get('low_value_filtered') for i in items),
+       'speculative_leads':sum(i.get('v13_recommendation')=='speculative' and not i.get('low_value_filtered') for i in items),
        'research_candidates':sum(i.get('v12_signal')=='research' for i in items),
        'matched_profiles':sum(bool(i.get('wynnpool')) for i in items),
        'partial_scan':not ((pages is not None and page>=int(pages)) or len(batch)<page_size),
@@ -486,7 +675,7 @@ def fetch_market(key,session=None,limit_pages=5,page_size=100):
 
 @app.get('/api/health')
 def health():
-    return {'version':'12','key_configured':bool(os.getenv('WYNNVENTORY_API_KEY')),
+    return {'version':'13.2','key_configured':bool(os.getenv('WYNNVENTORY_API_KEY')),
             'persistent_history_configured':bool(os.getenv('UPSTASH_REDIS_REST_URL') and os.getenv('UPSTASH_REDIS_REST_TOKEN'))}
 
 @app.get('/api/market')
