@@ -329,19 +329,21 @@ def estimate(row, peers, historical, id_weights=None, id_evidence=None, profile=
                 'verified_sales':False})
 
 
-def build(listings, previous, history, now, profiles=None):
+def build(listings, previous, history, now, profiles=None, reference_rows=None):
     profiles = profiles or {}
     old = previous.get('listings', {}) if isinstance(previous,dict) else {}
     grouped=defaultdict(list)
-    for row in listings:
+    for row in listings + (reference_rows or []):
         if row.get('name') and price_e(row) is not None:
             grouped[variant(row)].append(row)
     output=[]; new_seen={}; present=set()
+    live_ids = {identity(row) for row in listings}
     for group, rows in grouped.items():
         group_history=(history.get(group) or [])[-80:]
         id_weights,id_evidence=learn_id_weights(rows)
         for r in rows:
             ident=identity(r)
+            if ident not in live_ids: continue
             if ident in present: continue
             present.add(ident)
             first=(old.get(ident) or {}).get('first_seen') or now.isoformat()
