@@ -900,9 +900,13 @@ def fetch_market(key,session=None,limit_pages=5,page_size=100):
     suppress_trivial_leads(items)
     assess_sellability(items,rows,reference+historical_rows)
     mark_observation_freshness(items,now)
+    trends=trend_summaries(stored,lifecycle_entries,now.timestamp())
+    for item in items:
+        item['v16_trend']=trends.get(str(item.get('name') or '').strip().casefold(), {'asking_price_trend':'insufficient'})
+        item['v16_scenarios']=conservative_scenarios(item)
     items.sort(key=lambda x:x.get('listing_age_minutes') if x.get('listing_age_minutes') is not None else 1e10)
     timings['total']=round(time.perf_counter()-started,2)
-    return {'status':{'version':'15.2','scan_timings_seconds':timings,'updated_at':now.isoformat(),'scanned':len(rows),'exported':len(items),
+    return {'status':{'version':'16.0','scan_timings_seconds':timings,'updated_at':now.isoformat(),'scanned':len(rows),'exported':len(items),
        'recent_observations':sum(i.get('observation_freshness')=='recent' for i in items),
        'verification_needed':sum(i.get('observation_freshness')=='verify' for i in items),
        'stale_or_unknown':sum(i.get('observation_freshness') in ('stale','unknown') for i in items),
@@ -944,6 +948,73 @@ def fetch_market(key,session=None,limit_pages=5,page_size=100):
        'listings':items}
 
 
+# V16 analysis is derived from previously persisted observations, never sale records.
+def trend_summaries(history, lifecycle, now_s=None):
+    """7d versus preceding 7d snapshots, retaining absence of evidence explicitly."""
+    now_s = now_s or time.time()
+    periods = defaultdict(lambda: [[], []])
+    observations = history.get('observations', {}) if isinstance(history, dict) else {}
+    for r in observations.values():
+        if not isinstance(r, dict): continue
+        name = str(r.get('name') or '').strip().casefold()
+        price = number(r.get('listing_price'))
+        seen = number(r.get('observed_at'))
+        if not name or price is None or price <= 0 or seen is None: continue
+        days = (now_s-seen)/86400
+        if 0 <= days < 14:
+            periods[name][0 if days < 7 else 1].append(float(price))
+    entries = lifecycle if isinstance(lifecycle, dict) else {}
+    newcomers = defaultdict(lambda: [0,0])
+    for r in entries.values():
+        if not isinstance(r, dict): continue
+        name = str(r.get('name') or '').strip().casefold()
+        seen = number(r.get('first_seen'))
+        if not name or seen is None: continue
+        days = (now_s-seen)/86400
+        if 0 <= days < 14:
+            newcomers[name][0 if days < 7 else 1] += 1
+    result={}
+    for name in periods.keys() | newcomers.keys():
+        current, previous = periods[name]
+        now_new, prev_new = newcomers[name]
+        enough = len(current)>=5 and len(previous)>=5
+        median_now = round(statistics.median(current)) if current else None
+        median_before = round(statistics.median(previous)) if previous else None
+        delta = round(100*(median_now/median_before-1),1) if enough and median_before else None
+        # Never call observed arrivals a global supply estimate: scan coverage varies.
+        label = ('insufficient' if not enough else 'falling' if delta < -10 else 'rising' if delta > 10 else 'stable')
+        result[name] = {'current_7d_offers':len(current),'previous_7d_offers':len(previous),
+                        'median_ask_current_e':median_now,'median_ask_previous_e':median_before,
+                        'asking_price_change_pct':delta,'asking_price_trend':label,
+                        'observed_new_ids_7d':now_new,'observed_new_ids_prior_7d':prev_new,
+                        'supply_comparison_supported':prev_new>=5 and now_new>=5,
+                        'notes':'Asking prices and first-observed listings, not completed sales or total supply.'}
+    return result
+
+
+def conservative_scenarios(item):
+    """Quantile-style scenarios are *asking-price* sensitivities, not sale forecasts."""
+    buy=number(item.get('price_e'))
+    estimate=number(item.get('resale_estimate_e'))
+    low=None
+    supported = item.get('price_kind') in ('conservative_roll_asking_reference','unidentified_asking_reference')
+    if not supported or buy is None or estimate is None or estimate<=0:return {'supported':False,'reason':'No roll/UNID-matched resale asking reference'}
+    comps = int(number(item.get('comparables')) or 0)
+    if comps < 3:return {'supported':False,'reason':'Too few comparable offers for scenarios'}
+    # Sensitivity bands around an asking reference, not probabilistic intervals.
+    lower=round(estimate*0.75)
+    upper=round(estimate*1.10)
+    qty=max(1,int(number(item.get('quantity')) or 1))
+    fee=1.05 if item.get('price_assumption') == 'buyer_inclusive' else 1.0
+    purchase=number(item.get('purchase_total_e'))
+    if purchase is None:return {'supported':False,'reason':'Missing purchase cost'}
+    profits=[round(ref*qty/fee-purchase) for ref in (lower,estimate,upper)]
+    return {'supported':True,'kind':'asking_price_sensitivity_not_sale_prediction',
+            'low_e':lower,'reference_e':round(estimate),'high_e':upper,
+            'net_profit_low_e':profits[0],'net_profit_reference_e':profits[1],
+            'net_profit_high_e':profits[2],'comparable_count':comps,
+            'warning':'Illustrative 75%-110% sensitivity around matched asking reference; not a verified sale-price range.'}
+
 # V15 lootrun intelligence runs independently of the market scan and pricing keys.
 def pool_names(payload):
     """Extract only explicit item-name fields; do not mistake regions for items.
@@ -974,7 +1045,7 @@ def pool_names(payload):
 def lootpool_fetch(session,key):
     now=datetime.now(timezone.utc)
     week=now.isocalendar()
-    result={'version':'15.0','iso_year':week.year,'iso_week':week.week,'updated_at':now.isoformat(),
+    result={'version':'16.0','iso_year':week.year,'iso_week':week.week,'updated_at':now.isoformat(),
             'available':False,'items':[],'added':[],'removed':[],
             'source':'WynnVentory weekly lootpool','error':None,'historical_comparison':'unavailable',
             'warning':'Lootpool presence indicates potential incoming supply, not sales or future prices.'}
