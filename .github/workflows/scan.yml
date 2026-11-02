@@ -3,7 +3,7 @@ name: WynnFlip Market Scan
 on:
   workflow_dispatch:
   schedule:
-    - cron: "7,37 * * * *"
+    - cron: "3,13,23,33,43,53 * * * *"
 
 permissions:
   contents: write
@@ -35,7 +35,7 @@ jobs:
       - name: Scan market
         env:
           WYNNVENTORY_API_KEY: ${{ secrets.WYNNVENTORY_API_KEY }}
-          MAX_PAGES: "20"
+          MAX_PAGES: "10"
         run: python scanner.py
       - name: Validate output
         run: |
