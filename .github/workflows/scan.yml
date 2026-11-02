@@ -1,9 +1,9 @@
-name: WynnFlip Market Scan
+name: WynnFlip Market Scan (GitHub Only)
 
 on:
   workflow_dispatch:
   schedule:
-    - cron: "3,13,23,33,43,53 * * * *"
+    - cron: "3,8,13,18,23,28,33,38,43,48,53,58 * * * *"
 
 permissions:
   contents: write
@@ -51,7 +51,19 @@ jobs:
           git add data/ site/market.json profiles/item_weights.json
           if ! git diff --cached --quiet; then
             git commit -m "Update WynnFlip market observations"
-            git push
+            for attempt in 1 2 3 4 5; do
+              git fetch origin main
+              if ! git rebase origin/main; then
+                git rebase --abort
+                echo "Conflicting market output; preserving repository changes."
+                exit 1
+              fi
+              if git push origin HEAD:main; then
+                exit 0
+              fi
+              sleep 3
+            done
+            exit 1
           fi
       - name: Configure Pages
         uses: actions/configure-pages@v5
