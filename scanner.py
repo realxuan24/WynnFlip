@@ -158,6 +158,66 @@ def learn_id_weights(peers):
     return weights, evidence
 
 
+
+# Wynnpool community profiles are optional. No profile => no invented ID score.
+PROFILE_PATH = Path('profiles/item_weights.json')
+
+def normalized_name(value):
+    return ''.join(c for c in str(value or '').lower() if c.isalnum())
+
+def load_profiles(path=PROFILE_PATH):
+    """Expected normalized format: {item: {profile: {id_name: signed_weight}}}."""
+    raw = load(path, {})
+    if not isinstance(raw, dict):
+        return {}
+    valid = {}
+    for item, profiles in raw.items():
+        if not isinstance(profiles, dict):
+            continue
+        entries = {}
+        for name, ids in profiles.items():
+            if not isinstance(ids, dict):
+                continue
+            weights = {normalized_name(k): number(v) for k, v in ids.items()}
+            weights = {k: w for k, w in weights.items() if k and w is not None and -1 <= w <= 1 and w != 0}
+            if weights and .90 <= sum(abs(w) for w in weights.values()) <= 1.10:
+                entries[str(name)] = weights
+        if entries:
+            valid[normalized_name(item)] = entries
+    return valid
+
+def profile_quality(row, profiles):
+    """Report profile fit only when API roll percentages are plausibly 0..100.
+    A negative weight prefers a *lower* roll. No LE premium is inferred.
+    """
+    choices = profiles.get(normalized_name(row.get('name')), {})
+    rolls = {normalized_name(k): v for k, v in roll_numbers(row).items()}
+    scored = []
+    for profile, weights in choices.items():
+        shared = [(key, weight, rolls[key]) for key, weight in weights.items() if key in rolls]
+        coverage = sum(abs(weight) for _, weight, _ in shared)
+        if coverage < .75 or any(not (0 <= v <= 100) for _, _, v in shared):
+            continue
+        score = sum((v if weight > 0 else 100-v)*abs(weight) for _, weight, v in shared)/coverage
+        scored.append({'profile':profile, 'score':round(score,1), 'coverage':round(coverage,2),
+                       'important_ids':[{'stat':key,'weight':round(w,4),'roll':v,
+                                         'prefer':'higher' if w>0 else 'lower'}
+                                        for key,w,v in sorted(shared, key=lambda x:-abs(x[1]))[:6]]})
+    return max(scored, key=lambda x:x['score']) if scored else None
+
+def profile_similarity(a, b, profile):
+    if not profile:
+        return None
+    ids = profile.get('important_ids') or []
+    aa = {normalized_name(k):v for k,v in roll_numbers(a).items()}
+    bb = {normalized_name(k):v for k,v in roll_numbers(b).items()}
+    matched = [(abs(float(x['weight'])), abs(aa[x['stat']]-bb[x['stat']])) for x in ids
+               if x['stat'] in aa and x['stat'] in bb]
+    if not matched or sum(w for w,_ in matched) < .60:
+        return None
+    difference = sum(w*d for w,d in matched)/sum(w for w,_ in matched)
+    return max(.01, math.exp(-difference/13))
+
 def comparable(a, b, id_weights=None):
     aa, bb = roll_numbers(a), roll_numbers(b)
     shared = set(aa) & set(bb)
@@ -173,13 +233,17 @@ def comparable(a, b, id_weights=None):
     return .25 if not aa and not bb else .05
 
 
-def estimate(row, peers, historical, id_weights=None, id_evidence=None):
+def estimate(row, peers, historical, id_weights=None, id_evidence=None, profile=None):
     buy = price_e(row)
     if buy is None or buy <= 0: return None
     prices = [price_e(p) for p in peers if price_e(p) is not None]
-    comps = sorted((price_e(p), comparable(row,p,id_weights)) for p in peers
+    def similarity(peer):
+        if profile:
+            return profile_similarity(row, peer, profile) or 0.0
+        return comparable(row, peer, id_weights)
+    comps = sorted((price_e(p), similarity(p)) for p in peers
                    if identity(p) != identity(row) and price_e(p) is not None
-                   and comparable(row,p,id_weights) >= .12)
+                   and similarity(p) >= (.45 if profile else .12))
     if len(comps) < 4: return None
     med = statistics.median(v for v,_ in comps)
     comps = [(v,w) for v,w in comps if med*.4 <= v <= med*2.5]
@@ -203,10 +267,12 @@ def estimate(row, peers, historical, id_weights=None, id_evidence=None):
     roi = 100 * profit / buy  # buy is guaranteed positive above
     conf=max(.05,min(.95,.18+.035*min(12,len(comps))+.03*min(8,len(past))-.35*dispersion-(min(.2,volatility) if volatility is not None else .1)))
     high_risk=dispersion>.35 or (volatility is not None and volatility >= .12)
-    if profit > 0 and roi >= 25 and conf >= .45 and len(past)>=3 and not high_risk:
+    # Do not call a listing a strong candidate based solely on asking prices.
+    # Genuine buyer demand / completed transactions are not verified.
+    if False and profit > 0 and roi >= 25 and conf >= .45 and len(past)>=3 and not high_risk:
         category='candidate'
     elif profit > 0 and roi >= 15:
-        category='watch' if high_risk else 'potential'
+        category='watch' if high_risk or profile is None else 'potential'
     else:
         category='unrated'
     score=max(0,profit)/LE * max(0,roi/100)**.5 * conf * (1-min(.8,dispersion)) * (1-min(.8,(volatility or .07)*3))
@@ -214,7 +280,8 @@ def estimate(row, peers, historical, id_weights=None, id_evidence=None):
     if len(past)<3: warnings.append('Limited history')
     if high_risk: warnings.append('Unstable comparable prices')
     if len(comps)<7: warnings.append('Few comparable listings')
-    if not id_weights: warnings.append('ID premium not established')
+    if not profile: warnings.append('Wynnpool profile unavailable or roll format unverified')
+    warnings.append('Buyer demand and completed sales unverified')
     return dict(fair_e=fair,profit_e=profit,roi=round(roi,1),confidence=round(conf,3),
                 category=category,score=round(score,3),comparables=len(comps),
                 volatility=round(volatility,4) if volatility is not None else None,
@@ -225,7 +292,8 @@ def estimate(row, peers, historical, id_weights=None, id_evidence=None):
                 'verified_sales':False})
 
 
-def build(listings, previous, history, now):
+def build(listings, previous, history, now, profiles=None):
+    profiles = profiles or {}
     old = previous.get('listings', {}) if isinstance(previous,dict) else {}
     grouped=defaultdict(list)
     for row in listings:
@@ -243,7 +311,8 @@ def build(listings, previous, history, now):
             last=now.isoformat()  # observed in current API response, NOT confirmed in-game
             listing_age=age_minutes(r.get('timestamp'),now)
             observation_age=0
-            analysis=estimate(r,rows,group_history,id_weights,id_evidence)
+            profile=profile_quality(r, profiles)
+            analysis=estimate(r,rows,group_history,id_weights,id_evidence,profile)
             item=dict(id=ident,name=r.get('name'),rarity=r.get('tier') or '',
                       item_type=r.get('item_type') or '',subtype=r.get('subtype') or '',
                       quantity=r.get('amount') or 1,price_e=price_e(r),
@@ -253,8 +322,10 @@ def build(listings, previous, history, now):
                       observed_age_minutes=observation_age,
                       category='unrated',fair_e=None,profit_e=None,roi=None,score=0,
                       id_pricing={'method':'insufficient evidence','weighted_ids':[],'verified_sales':False},
+                      wynnpool=profile,
                       confidence=None,stability='unknown',warnings=[])
             if analysis: item.update(analysis)
+            item['wynnpool']=profile
             # Without a trustworthy listing timestamp, freshness cannot be asserted.
             if listing_age is None:
                 item['freshness']='unknown'
@@ -303,21 +374,22 @@ def main():
         if not items or len(items)<page_size:break
         if total_pages is not None and page>=int(total_pages):break
     if not rows:raise RuntimeError('Scanner returned zero listings; refusing to publish blank data')
-    output,seen,history=build(rows,old,history,now)
+    profiles=load_profiles()
+    output,seen,history=build(rows,old,history,now,profiles)
     loot={'state':'unavailable','note':'Lootpool data unavailable'}
     try:
         pool=get(session,'/lootpools/current/items',key)
         loot={'state':'available','data':pool}
     except (requests.RequestException,ValueError) as err:
         loot['note']=f'Lootpool lookup unavailable ({type(err).__name__})'
-    status={'version':'5','updated_at':now.isoformat(),'scanned':len(rows),'exported':len(output),
+    status={'version':'6','updated_at':now.isoformat(),'scanned':len(rows),'exported':len(output),
             'pages':page,'total_pages':total_pages,
             'complete':bool((total_pages and page>=int(total_pages)) or len(items)<page_size),
             'note':'Observed API listings, not confirmed in-game availability; timestamps may be missing.'}
     save(DATA/'observed.json', {'listings':seen})
     save(DATA/'history_v4.json',history)
     save(SITE/'market.json',{'status':status,'listings':output,'lootpool':loot})
-    print('Scan OK V5:',status['scanned'],'observed;',len(output),'exported;',status['complete'],'complete')
+    print('Scan OK V6:',status['scanned'],'observed;',len(output),'exported;',status['complete'],'complete')
 
 
 if __name__ == '__main__':main()
