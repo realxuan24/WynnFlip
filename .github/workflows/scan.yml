@@ -8,6 +8,8 @@ on:
 
 permissions:
   contents: write
+  pages: write
+  id-token: write
 
 concurrency:
   group: wynnflip-scanner
@@ -17,6 +19,10 @@ jobs:
   scan:
     runs-on: ubuntu-latest
     timeout-minutes: 15
+
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
 
     steps:
       - name: Checkout repository
@@ -35,34 +41,13 @@ jobs:
           WYNNVENTORY_API_KEY: ${{ secrets.WYNNVENTORY_API_KEY }}
         run: python scanner.py
 
-     
       - name: Verify website files
         run: |
-          echo "Checking WynnFlip files..."
-          echo "Files in repository:"
-          ls -la
-          echo "Files in site folder:"
-          ls -la site/ || true
+          test -s site/index.html
+          test -s site/market.json
+          python -m json.tool site/market.json > /dev/null
 
-          if [ ! -s site/index.html ]; then
-            echo "ERROR: site/index.html is missing or empty"
-            exit 1
-          fi
-
-          if [ ! -s site/market.json ]; then
-            echo "ERROR: site/market.json is missing or empty"
-            exit 1
-          fi
-
-          if ! python -m json.tool site/market.json > /dev/null; then
-            echo "ERROR: market.json contains invalid JSON"
-            exit 1
-          fi
-
-          echo "SUCCESS: All website files verified"
-
-
-      - name: Save market history
+      - name: Save market data
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
@@ -72,9 +57,14 @@ jobs:
             git push
           fi
 
-      - name: Deploy website to Cloudflare
-        uses: cloudflare/wrangler-action@v4
+      - name: Configure GitHub Pages
+        uses: actions/configure-pages@v5
+
+      - name: Upload website
+        uses: actions/upload-pages-artifact@v4
         with:
-          apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
-          accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
-          command: deploy
+          path: site/
+
+      - name: Deploy website
+        id: deployment
+        uses: actions/deploy-pages@v4
