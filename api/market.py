@@ -215,6 +215,123 @@ def persist_history(rows):
     result,error=redis_call([['EVAL',HISTORY_MERGE_LUA,1,'wynnflip:v12:history',json.dumps(incoming,separators=(',',':'))]])
     return (int(result[0]) if result and result[0] is not None else None),error
 
+# V14 lifecycle cache is separate from V12 pricing history (never overwritten).
+LIFECYCLE_KEY = 'wynnflip:v14:listing_lifecycle'
+LIFECYCLE_LUA = r"""
+local raw=redis.call('GET',KEYS[1])
+local old={entries={}}
+if raw then
+  local ok,v=pcall(cjson.decode,raw)
+  if ok and type(v)=='table' and type(v.entries)=='table' then old=v end
+end
+local entries=old.entries
+local now=tonumber(ARGV[1]);local scan=cjson.decode(ARGV[2])
+local complete=ARGV[3]=='1'
+local seen={}
+local new_count=0;local repeat_count=0
+for id,r in pairs(scan) do
+  seen[id]=true
+  local v=entries[id]
+  if type(v)~='table' then
+    v={name=r.name,first_seen=now,last_seen=now,scans_seen=1,initial_price=r.price,latest_price=r.price,price_changes=0,misses=0}
+    entries[id]=v;new_count=new_count+1
+  else
+    -- Track observations only when genuinely processed by a new scan.
+    if now>tonumber(v.last_seen or 0) then
+      v.scans_seen=math.min(100000,tonumber(v.scans_seen or 1)+1)
+      repeat_count=repeat_count+1
+    end
+    if r.price and v.latest_price and tonumber(r.price)~=tonumber(v.latest_price) then
+      v.price_changes=math.min(100000,tonumber(v.price_changes or 0)+1)
+    end
+    v.latest_price=r.price;v.last_seen=math.max(now,tonumber(v.last_seen or 0));v.misses=0
+  end
+end
+if complete then
+  for id,v in pairs(entries) do
+    if not seen[id] and type(v)=='table' and tonumber(v.last_seen or 0)<now then
+      v.misses=math.min(100,tonumber(v.misses or 0)+1)
+    end
+  end
+end
+local ordered={}
+for id,v in pairs(entries) do
+  table.insert(ordered,{id=id,t=tonumber(v.last_seen or 0)})
+end
+table.sort(ordered,function(a,b) if a.t==b.t then return a.id<b.id else return a.t>b.t end end)
+for i=12001,#ordered do entries[ordered[i].id]=nil end
+old.updated_at=now
+redis.call('SET',KEYS[1],cjson.encode(old),'EX',86400*45)
+return cjson.encode({new_count=new_count,repeat_count=repeat_count,tracked=math.min(#ordered,12000)})
+"""
+
+def lifecycle_input(rows):
+    """Stable identifiers only; fabricated IDs must not become turnover evidence."""
+    incoming={}
+    for row in rows:
+        listing_id=row.get('hash_code')
+        price=price_e(row)
+        if not listing_id or not row.get('name') or price is None or price<=0:
+            continue
+        listing_id=str(listing_id)
+        if listing_id.startswith('archive:') or len(listing_id)>180:
+            continue
+        incoming[listing_id]={'name':str(row['name'])[:100], 'price':price}
+    return incoming
+
+def update_lifecycle(rows, complete, observed_at):
+    incoming=lifecycle_input(rows)
+    if not incoming:
+        return None,'no stable identifiers',{}
+    result,err=redis_call([['EVAL', LIFECYCLE_LUA,1,LIFECYCLE_KEY,
+                            str(int(observed_at)),json.dumps(incoming,separators=(',',':')),
+                            '1' if complete else '0']])
+    if err:return None,err,{}
+    try:
+        counts=json.loads(result[0]);return counts,None,incoming
+    except (TypeError,ValueError,IndexError):return None,'invalid lifecycle update',{}
+
+def read_lifecycle():
+    result,error=redis_call([['GET',LIFECYCLE_KEY]])
+    if error:return {},error
+    try:
+        value=json.loads(result[0]) if result and result[0] else {}
+        entries=value.get('entries',{}) if isinstance(value,dict) else {}
+        return entries if isinstance(entries,dict) else {},None
+    except (TypeError,ValueError):return {},'invalid lifecycle JSON'
+
+def lifecycle_summary(items,entries,now,complete):
+    """7/30d listing entry and observed persistence; never call removals sales."""
+    current=now.timestamp()
+    by_name=defaultdict(list)
+    for key,r in entries.items():
+        if not isinstance(r,dict):continue
+        name=str(r.get('name') or '').casefold().strip()
+        if name:by_name[name].append(r)
+    stats={}
+    for name,group in by_name.items():
+        def last(v):return float(number(v.get('last_seen')) or 0)
+        def first(v):return float(number(v.get('first_seen')) or 0)
+        n7=sum(0<=current-first(v)<=7*86400 for v in group)
+        n30=sum(0<=current-first(v)<=30*86400 for v in group)
+        retained=sum(int(number(v.get('scans_seen')) or 0)>=2 for v in group)
+        eligible=sum(last(v)>=current-7*86400 for v in group)
+        missing=sum(int(number(v.get('misses')) or 0)>=2 for v in group) if complete else None
+        # Unknown for incomplete scans: pagination absence is NOT turnover.
+        stats[name]={'new_listings_7d':n7,'new_listings_30d':n30,
+                     'reobserved_listings':retained,'recently_observed_listings':eligible,
+                     'unobserved_complete_scans':missing,
+                     'confidence':'early' if n30<5 else 'developing' if n30<20 else 'established',
+                     'verified_sales':0,'sale_rate':None}
+    for item in items:
+        key=str(item.get('name') or '').casefold().strip()
+        item['lifecycle']=stats.get(key,{'new_listings_7d':0,'new_listings_30d':0,
+            'reobserved_listings':0,'recently_observed_listings':0,
+            'unobserved_complete_scans':None,'confidence':'insufficient',
+            'verified_sales':0,'sale_rate':None})
+    return {'tracked_items':len(by_name),'entries_7d':sum(0<=current-float(number(e.get('first_seen')) or 0)<=7*86400 for e in entries.values() if isinstance(e,dict)),
+            'reobserved':sum(int(number(e.get('scans_seen')) or 0)>=2 for e in entries.values() if isinstance(e,dict))}
+
 def apply_baselines(items,baselines,session,key):
     filled=0; lookups=0; groups=defaultdict(list)
     for item in items:groups[str(item.get('name','')).strip().casefold()].append(item)
@@ -621,6 +738,8 @@ def fetch_market(key,session=None,limit_pages=5,page_size=100):
     rows = deduplicate_recent(rows)
     if not rows:raise ValueError('No market listings returned')
     now=datetime.now(timezone.utc)
+    # Only complete pagination is eligible for absence statistics.
+    complete_scan=bool((pages is not None and page>=int(pages)) or len(batch)<page_size)
     reference=snapshot(session)
     stored,history_read_error=load_history()
     # Bounded historical distinct observations, stored as explicit comparison-only data.
@@ -664,13 +783,31 @@ def fetch_market(key,session=None,limit_pages=5,page_size=100):
     suppress_trivial_leads(items)
     assess_sellability(items,rows,reference+historical_rows)
     mark_observation_freshness(items,now)
+    lifecycle_write_error=None
+    lifecycle_counts=None
+    lifecycle_entries={}
+    lifecycle_read_error=None
+    lifecycle_metrics={'tracked_items':0,'entries_7d':0,'reobserved':0}
+    if configured:
+        lifecycle_counts,lifecycle_write_error,_=update_lifecycle(rows,complete_scan,now.timestamp())
+        lifecycle_entries,lifecycle_read_error=read_lifecycle()
+        if lifecycle_read_error is None:
+            lifecycle_metrics=lifecycle_summary(items,lifecycle_entries,now,complete_scan)
     items.sort(key=lambda x:x.get('listing_age_minutes') if x.get('listing_age_minutes') is not None else 1e10)
-    return {'status':{'version':'13.3','updated_at':now.isoformat(),'scanned':len(rows),'exported':len(items),
+    return {'status':{'version':'14.0','updated_at':now.isoformat(),'scanned':len(rows),'exported':len(items),
        'recent_observations':sum(i.get('observation_freshness')=='recent' for i in items),
        'verification_needed':sum(i.get('observation_freshness')=='verify' for i in items),
        'stale_or_unknown':sum(i.get('observation_freshness') in ('stale','unknown') for i in items),
        'newest_observation_age_minutes':min((i['listing_age_minutes'] for i in items if i.get('listing_age_minutes') is not None),default=None),
        'reference_offers':len(reference),
+       'lifecycle_tracked_listings':lifecycle_counts.get('tracked') if lifecycle_counts else len(lifecycle_entries),
+       'lifecycle_new_on_scan':lifecycle_counts.get('new_count') if lifecycle_counts else None,
+       'lifecycle_reobserved_on_scan':lifecycle_counts.get('repeat_count') if lifecycle_counts else None,
+       'lifecycle_new_7d':lifecycle_metrics['entries_7d'],
+       'lifecycle_reobserved':lifecycle_metrics['reobserved'],
+       'lifecycle_complete_scan':complete_scan,
+       'lifecycle_write_error':lifecycle_write_error,'lifecycle_read_error':lifecycle_read_error,
+       'lifecycle_available':configured and lifecycle_write_error is None and lifecycle_read_error is None,
        'pricing_index_cached_items':len(bases),'pricing_index_read_error':cache_error,'pricing_index_write_error':index_write_error,'durable_history_offers':history_total,'persistent_history':durable,
        'history_configured':configured,'history_read_error':history_read_error,
        'history_write_error':history_write_error,
@@ -687,13 +824,13 @@ def fetch_market(key,session=None,limit_pages=5,page_size=100):
        'speculative_leads':sum(i.get('v13_recommendation')=='speculative' and not i.get('low_value_filtered') for i in items),
        'research_candidates':sum(i.get('v12_signal')=='research' for i in items),
        'matched_profiles':sum(bool(i.get('wynnpool')) for i in items),
-       'partial_scan':not ((pages is not None and page>=int(pages)) or len(batch)<page_size),
-       'notes':'Asking-price comparisons only; sales, turnover and availability unverified.'},
+       'partial_scan':not complete_scan,
+       'notes':'Lifecycle counts are observations, not sales. Incomplete scans never imply a listing disappeared.'},
        'listings':items}
 
 @app.get('/api/health')
 def health():
-    return {'version':'13.3','key_configured':bool(os.getenv('WYNNVENTORY_API_KEY')),
+    return {'version':'14.0','key_configured':bool(os.getenv('WYNNVENTORY_API_KEY')),
             'persistent_history_configured':bool(os.getenv('UPSTASH_REDIS_REST_URL') and os.getenv('UPSTASH_REDIS_REST_TOKEN'))}
 
 @app.get('/api/market')
