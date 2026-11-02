@@ -411,7 +411,58 @@ def apply_trade_costs(items):
             item['price_kind'] = 'baseline_only' if fair else 'unknown'
     return items
 
-def fetch_market(key,session=None,limit_pages=2,page_size=100):
+
+
+def add_tentative_price_ranges(items, historical_rows):
+    """Expose low-confidence same-status ASKING-price ranges, not sale predictions.
+
+    Never mingle identified, unidentified or unknown-status offers. Unique
+    listing identifiers prevent repeat scans from manufacturing sample size.
+    Identified gear is NOT roll-adjusted here. These ranges are excluded from
+    opportunity classifications and potential-profit calculations.
+    """
+    pools = defaultdict(dict)
+    for row in historical_rows:
+        status = identification_status(row)
+        if status not in ('identified', 'unidentified'):
+            continue
+        price = price_e(row)
+        if not price or price <= 0:
+            continue
+        key = (str(row.get('name') or '').strip().casefold(),
+               str(row.get('tier') or '').strip().casefold(),
+               str(row.get('item_type') or '').strip().casefold(),
+               str(row.get('subtype') or '').strip().casefold(),
+               str(row.get('shiny_stat') or '').strip().casefold(), status)
+        if key[0]:
+            pools[key][identity(row)] = round(price)
+    count = 0
+    for item in items:
+        item['tentative_range_e'] = None
+        item['tentative_sample_count'] = 0
+        if item.get('resale_estimate_e') is not None:
+            continue
+        status = item.get('identification_status')
+        if status not in ('identified', 'unidentified'):
+            continue
+        key = (str(item.get('name') or '').strip().casefold(),
+               str(item.get('rarity') or '').strip().casefold(),
+               str(item.get('item_type') or '').strip().casefold(),
+               str(item.get('subtype') or '').strip().casefold(),
+               str(item.get('shiny_stat') or '').strip().casefold(), status)
+        own_id = str(item.get('id') or '')
+        prices = sorted(p for listing_id, p in pools.get(key, {}).items() if listing_id != own_id)
+        if not prices:
+            continue
+        # With only one comparable, show a reference point rather than a
+        # fabricated interval. With 2+, report the observed asking-price span.
+        item['tentative_range_e'] = {'low': prices[0], 'high': prices[-1]}
+        item['tentative_sample_count'] = len(prices)
+        item['tentative_range_kind'] = 'UNID-only historical asks' if status == 'unidentified' else 'identified same-item asks; rolls unadjusted'
+        count += 1
+    return count
+
+def fetch_market(key,session=None,limit_pages=5,page_size=100):
     session=session or requests.Session();rows=[];pages=None
     for page in range(1,limit_pages+1):
         data=get_json(session,BASE+'/api/v2/market/listings',key,
@@ -446,13 +497,14 @@ def fetch_market(key,session=None,limit_pages=2,page_size=100):
     else:
         history_total=len(prior)
     apply_trade_costs(items)
+    tentative_count=add_tentative_price_ranges(items,rows+reference+historical_rows)
     suppress_trivial_leads(items)
     items.sort(key=lambda x:x.get('listing_age_minutes') if x.get('listing_age_minutes') is not None else 1e10)
     return {'status':{'version':'12','updated_at':now.isoformat(),'scanned':len(rows),'exported':len(items),
        'reference_offers':len(reference),'durable_history_offers':history_total,'persistent_history':durable,
        'history_configured':configured,'history_read_error':history_read_error,
        'history_write_error':history_write_error,
-       'unidentified_resale_estimates':unid_estimates,'baseline_items':len(bases),'baseline_estimates':n_baseline,'status_matched_base_estimates':matched_baselines,'baseline_source':source,
+       'unidentified_resale_estimates':unid_estimates,'tentative_price_ranges':tentative_count,'baseline_items':len(bases),'baseline_estimates':n_baseline,'status_matched_base_estimates':matched_baselines,'baseline_source':source,
        'baseline_errors':errors,'individual_price_lookups':n_lookup,
        'low_value_suppressed':sum(bool(i.get('low_value_filtered')) for i in items),
        'roll_opportunities':sum(i.get('v12_signal')=='roll_opportunity' for i in items),
