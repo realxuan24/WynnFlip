@@ -1,6 +1,6 @@
 [project]
 name = "wynnflip"
-version = "0.10.0"
+version = "0.11.0"
 requires-python = ">=3.12"
 dependencies = ["requests>=2.31.0,<3", "fastapi>=0.115.0,<1"]
 
