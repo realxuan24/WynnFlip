@@ -56,7 +56,8 @@ def price_e(row):
     quantity = number(row.get('amount'), 1)
     if amount is None or amount <= 0 or not quantity or quantity <= 0:
         return None
-    return round(amount / quantity)
+    unit = round(amount / quantity)
+    return unit if unit > 0 else None
 
 
 def identity(row):
@@ -112,7 +113,7 @@ def comparable(a, b):
 
 def estimate(row, peers, historical):
     buy = price_e(row)
-    if buy is None: return None
+    if buy is None or buy <= 0: return None
     prices = [price_e(p) for p in peers if price_e(p) is not None]
     comps = sorted((price_e(p), comparable(row,p)) for p in peers
                    if identity(p) != identity(row) and price_e(p) is not None
@@ -137,7 +138,7 @@ def estimate(row, peers, historical):
     haircut=min(.5,.10 + .35*dispersion + (1.2*min(.2,volatility) if volatility is not None else .1))
     fair=max(0, math.floor(conservative_base*(1-haircut)))
     profit=fair-buy
-    roi = 100 * profit / buy
+    roi = 100 * profit / buy  # buy is guaranteed positive above
     conf=max(.05,min(.95,.18+.035*min(12,len(comps))+.03*min(8,len(past))-.35*dispersion-(min(.2,volatility) if volatility is not None else .1)))
     high_risk=dispersion>.35 or (volatility is not None and volatility >= .12)
     if profit > 0 and roi >= 25 and conf >= .45 and len(past)>=3 and not high_risk:
