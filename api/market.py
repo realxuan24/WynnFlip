@@ -233,7 +233,7 @@ for id,r in pairs(scan) do
   seen[id]=true
   local v=entries[id]
   if type(v)~='table' then
-    v={name=r.name,first_seen=now,last_seen=now,scans_seen=1,initial_price=r.price,latest_price=r.price,price_changes=0,misses=0}
+    v={name=r.name,first_seen=now,last_seen=now,scans_seen=1,initial_price=r.price,latest_price=r.price,price_changes=0,price_reductions=0,misses=0}
     entries[id]=v;new_count=new_count+1
   else
     -- Track observations only when genuinely processed by a new scan.
@@ -243,6 +243,9 @@ for id,r in pairs(scan) do
     end
     if r.price and v.latest_price and tonumber(r.price)~=tonumber(v.latest_price) then
       v.price_changes=math.min(100000,tonumber(v.price_changes or 0)+1)
+      if tonumber(r.price)<tonumber(v.latest_price) then
+        v.price_reductions=math.min(100000,tonumber(v.price_reductions or 0)+1)
+      end
     end
     v.latest_price=r.price;v.last_seen=math.max(now,tonumber(v.last_seen or 0));v.misses=0
   end
@@ -315,11 +318,18 @@ def lifecycle_summary(items,entries,now,complete):
         n7=sum(0<=current-first(v)<=7*86400 for v in group)
         n30=sum(0<=current-first(v)<=30*86400 for v in group)
         retained=sum(int(number(v.get('scans_seen')) or 0)>=2 for v in group)
+        reductions=sum(int(number(v.get('price_reductions')) or 0) for v in group)
+        changes=sum(int(number(v.get('price_changes')) or 0) for v in group)
+        persistent=sum(int(number(v.get('scans_seen')) or 0)>=3 for v in group)
+        span_hours=[max(0,(last(v)-first(v))/3600) for v in group if int(number(v.get('scans_seen')) or 0)>=2]
+        longest=round(max(span_hours),1) if span_hours else None
         eligible=sum(last(v)>=current-7*86400 for v in group)
         missing=sum(int(number(v.get('misses')) or 0)>=2 for v in group) if complete else None
         # Unknown for incomplete scans: pagination absence is NOT turnover.
         stats[name]={'new_listings_7d':n7,'new_listings_30d':n30,
                      'reobserved_listings':retained,'recently_observed_listings':eligible,
+                     'price_reductions':reductions,'price_changes':changes,
+                     'persistent_listings':persistent,'longest_observed_hours':longest,
                      'unobserved_complete_scans':missing,
                      'confidence':'early' if n30<5 else 'developing' if n30<20 else 'established',
                      'verified_sales':0,'sale_rate':None}
@@ -327,9 +337,14 @@ def lifecycle_summary(items,entries,now,complete):
         key=str(item.get('name') or '').casefold().strip()
         item['lifecycle']=stats.get(key,{'new_listings_7d':0,'new_listings_30d':0,
             'reobserved_listings':0,'recently_observed_listings':0,
+            'price_reductions':0,'price_changes':0,'persistent_listings':0,'longest_observed_hours':None,
             'unobserved_complete_scans':None,'confidence':'insufficient',
             'verified_sales':0,'sale_rate':None})
-    return {'tracked_items':len(by_name),'entries_7d':sum(0<=current-float(number(e.get('first_seen')) or 0)<=7*86400 for e in entries.values() if isinstance(e,dict)),
+    return {'tracked_items':len(by_name),'entries_30d':sum(0<=current-float(number(e.get('first_seen')) or 0)<=30*86400 for e in entries.values() if isinstance(e,dict)),
+            'price_changes':sum(int(number(e.get('price_changes')) or 0) for e in entries.values() if isinstance(e,dict)),
+            'price_reductions':sum(int(number(e.get('price_reductions')) or 0) for e in entries.values() if isinstance(e,dict)),
+            'persistent':sum(int(number(e.get('scans_seen')) or 0)>=3 for e in entries.values() if isinstance(e,dict)),
+            'entries_7d':sum(0<=current-float(number(e.get('first_seen')) or 0)<=7*86400 for e in entries.values() if isinstance(e,dict)),
             'reobserved':sum(int(number(e.get('scans_seen')) or 0)>=2 for e in entries.values() if isinstance(e,dict))}
 
 def apply_baselines(items,baselines,session,key):
@@ -787,24 +802,30 @@ def fetch_market(key,session=None,limit_pages=5,page_size=100):
     lifecycle_counts=None
     lifecycle_entries={}
     lifecycle_read_error=None
-    lifecycle_metrics={'tracked_items':0,'entries_7d':0,'reobserved':0}
+    lifecycle_metrics={'tracked_items':0,'entries_7d':0,'entries_30d':0,'reobserved':0,'price_changes':0,'price_reductions':0,'persistent':0}
     if configured:
         lifecycle_counts,lifecycle_write_error,_=update_lifecycle(rows,complete_scan,now.timestamp())
         lifecycle_entries,lifecycle_read_error=read_lifecycle()
         if lifecycle_read_error is None:
             lifecycle_metrics=lifecycle_summary(items,lifecycle_entries,now,complete_scan)
     items.sort(key=lambda x:x.get('listing_age_minutes') if x.get('listing_age_minutes') is not None else 1e10)
-    return {'status':{'version':'14.0','updated_at':now.isoformat(),'scanned':len(rows),'exported':len(items),
+    return {'status':{'version':'14.1','updated_at':now.isoformat(),'scanned':len(rows),'exported':len(items),
        'recent_observations':sum(i.get('observation_freshness')=='recent' for i in items),
        'verification_needed':sum(i.get('observation_freshness')=='verify' for i in items),
        'stale_or_unknown':sum(i.get('observation_freshness') in ('stale','unknown') for i in items),
        'newest_observation_age_minutes':min((i['listing_age_minutes'] for i in items if i.get('listing_age_minutes') is not None),default=None),
        'reference_offers':len(reference),
        'lifecycle_tracked_listings':lifecycle_counts.get('tracked') if lifecycle_counts else len(lifecycle_entries),
+       'lifecycle_eligible_scan_ids':len(lifecycle_input(rows)),
        'lifecycle_new_on_scan':lifecycle_counts.get('new_count') if lifecycle_counts else None,
        'lifecycle_reobserved_on_scan':lifecycle_counts.get('repeat_count') if lifecycle_counts else None,
        'lifecycle_new_7d':lifecycle_metrics['entries_7d'],
        'lifecycle_reobserved':lifecycle_metrics['reobserved'],
+       'lifecycle_new_30d':lifecycle_metrics['entries_30d'],
+       'lifecycle_price_changes':lifecycle_metrics['price_changes'],
+       'lifecycle_price_reductions':lifecycle_metrics['price_reductions'],
+       'lifecycle_persistent':lifecycle_metrics['persistent'],
+       'lifecycle_read_status':'ok' if lifecycle_read_error is None and configured else 'unavailable',
        'lifecycle_complete_scan':complete_scan,
        'lifecycle_write_error':lifecycle_write_error,'lifecycle_read_error':lifecycle_read_error,
        'lifecycle_available':configured and lifecycle_write_error is None and lifecycle_read_error is None,
@@ -830,7 +851,7 @@ def fetch_market(key,session=None,limit_pages=5,page_size=100):
 
 @app.get('/api/health')
 def health():
-    return {'version':'14.0','key_configured':bool(os.getenv('WYNNVENTORY_API_KEY')),
+    return {'version':'14.1','key_configured':bool(os.getenv('WYNNVENTORY_API_KEY')),
             'persistent_history_configured':bool(os.getenv('UPSTASH_REDIS_REST_URL') and os.getenv('UPSTASH_REDIS_REST_TOKEN'))}
 
 @app.get('/api/market')
