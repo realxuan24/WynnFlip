@@ -1,4 +1,4 @@
-"""WynnFlip V4: scheduled, read-only WynnVentory market observer.
+"""WynnFlip V5: scheduled, read-only WynnVentory market observer.
 Listing presence is NOT proof of in-game availability.
 """
 import hashlib
@@ -98,26 +98,88 @@ def age_minutes(value, now):
     return max(0, round((now - dt).total_seconds() / 60, 1)) if dt else None
 
 
-def comparable(a, b):
-    aa, bb = a.get('stat_rolls') or {}, b.get('stat_rolls') or {}
-    if isinstance(aa, dict) and isinstance(bb, dict):
-        shared = set(aa) & set(bb)
-        diffs = [abs(number(aa[k], 999)-number(bb[k], 999)) for k in shared]
-        if len(diffs) >= 2:
-            return max(0.01, math.exp(-statistics.mean(diffs) / 16) * min(1, len(diffs)/4))
+def roll_numbers(row):
+    """Numeric individual roll fields; reject malformed roll payloads."""
+    rolls = row.get('stat_rolls') or {}
+    if not isinstance(rolls, dict):
+        return {}
+    return {str(k): v for k, raw in rolls.items()
+            if (v := number(raw)) is not None and abs(v) <= 100000}
+
+
+def rank_correlation(pairs):
+    """Spearman-like rank correlation; 0 means no observable relation."""
+    def ranks(seq):
+        order = sorted(range(len(seq)), key=lambda i: seq[i])
+        result = [0.0] * len(seq)
+        i = 0
+        while i < len(seq):
+            j = i + 1
+            while j < len(seq) and seq[order[j]] == seq[order[i]]:
+                j += 1
+            avg = (i + j - 1) / 2
+            for k in range(i, j): result[order[k]] = avg
+            i = j
+        return result
+    x, y = ranks([v for v, _ in pairs]), ranks([v for _, v in pairs])
+    mx, my = statistics.mean(x), statistics.mean(y)
+    numerator = sum((a-mx)*(b-my) for a,b in zip(x,y))
+    denom = math.sqrt(sum((a-mx)**2 for a in x)*sum((b-my)**2 for b in y))
+    return numerator/denom if denom else 0.0
+
+
+def learn_id_weights(peers):
+    """Conservative *asking-price associations*, not true stat desirability.
+
+    Only learn from sufficiently varied current offers. Never infer weight from
+    tiny samples or virtually identical prices.
+    """
+    priced = [(r, price_e(r)) for r in peers if price_e(r) is not None]
+    if len(priced) < 12 or len(set(price for _,price in priced)) < 5:
+        return {}, {}
+    # Ignore extreme asking-price outliers before learning associations.
+    values = sorted(v for _,v in priced)
+    low, high = values[max(0,int(len(values)*.1))], values[min(len(values)-1,int(len(values)*.9))]
+    fields = set().union(*(roll_numbers(r).keys() for r,_ in priced))
+    weights, evidence = {}, {}
+    for field in fields:
+        pairs = [(roll_numbers(row)[field], math.log(price)) for row,price in priced
+                 if low <= price <= high and field in roll_numbers(row) and price > 0]
+        if len(pairs) < 10 or len(set(x for x,_ in pairs)) < 5 or len(set(y for _,y in pairs)) < 5:
+            continue
+        association = rank_correlation(pairs)
+        # Treat strength as a similarity weight, not a price multiplier.
+        # Only appreciable associations matter and caps prevent dominating.
+        if abs(association) < .25: continue
+        weight = min(1.8, 1.0 + abs(association)*.8)
+        weights[field] = round(weight, 3)
+        evidence[field] = {'association':round(association,3), 'sample_size':len(pairs),
+                           'direction':'higher asking prices' if association>0 else 'lower asking prices'}
+    return weights, evidence
+
+
+def comparable(a, b, id_weights=None):
+    aa, bb = roll_numbers(a), roll_numbers(b)
+    shared = set(aa) & set(bb)
+    if len(shared) >= 2:
+        weights = id_weights or {}
+        distances = [abs(aa[k]-bb[k])*weights.get(k,1.0) for k in shared]
+        divisor = sum(weights.get(k,1.0) for k in shared)
+        difference = sum(distances)/max(divisor,1e-9)
+        return max(.01,math.exp(-difference/16)*min(1,len(shared)/4))
     x, y = number(a.get('overall_roll')), number(b.get('overall_roll'))
     if x is not None and y is not None:
-        return 0.5 * math.exp(-abs(x-y)/13)
-    return 0.25 if not aa and not bb else 0.05
+        return .5*math.exp(-abs(x-y)/13)
+    return .25 if not aa and not bb else .05
 
 
-def estimate(row, peers, historical):
+def estimate(row, peers, historical, id_weights=None, id_evidence=None):
     buy = price_e(row)
     if buy is None or buy <= 0: return None
     prices = [price_e(p) for p in peers if price_e(p) is not None]
-    comps = sorted((price_e(p), comparable(row,p)) for p in peers
+    comps = sorted((price_e(p), comparable(row,p,id_weights)) for p in peers
                    if identity(p) != identity(row) and price_e(p) is not None
-                   and comparable(row,p) >= .12)
+                   and comparable(row,p,id_weights) >= .12)
     if len(comps) < 4: return None
     med = statistics.median(v for v,_ in comps)
     comps = [(v,w) for v,w in comps if med*.4 <= v <= med*2.5]
@@ -152,11 +214,15 @@ def estimate(row, peers, historical):
     if len(past)<3: warnings.append('Limited history')
     if high_risk: warnings.append('Unstable comparable prices')
     if len(comps)<7: warnings.append('Few comparable listings')
+    if not id_weights: warnings.append('ID premium not established')
     return dict(fair_e=fair,profit_e=profit,roi=round(roi,1),confidence=round(conf,3),
                 category=category,score=round(score,3),comparables=len(comps),
                 volatility=round(volatility,4) if volatility is not None else None,
                 stability='volatile' if high_risk else ('unknown' if len(past)<3 else 'stable'),
-                warnings=warnings)
+                warnings=warnings, id_pricing={'method':'listing-price association only',
+                'weighted_ids':sorted(({'stat':k,'weight':w,**(id_evidence or {}).get(k,{})}
+                 for k,w in (id_weights or {}).items()), key=lambda z:-z['weight'])[:8],
+                'verified_sales':False})
 
 
 def build(listings, previous, history, now):
@@ -168,6 +234,7 @@ def build(listings, previous, history, now):
     output=[]; new_seen={}; present=set()
     for group, rows in grouped.items():
         group_history=(history.get(group) or [])[-80:]
+        id_weights,id_evidence=learn_id_weights(rows)
         for r in rows:
             ident=identity(r)
             if ident in present: continue
@@ -176,7 +243,7 @@ def build(listings, previous, history, now):
             last=now.isoformat()  # observed in current API response, NOT confirmed in-game
             listing_age=age_minutes(r.get('timestamp'),now)
             observation_age=0
-            analysis=estimate(r,rows,group_history)
+            analysis=estimate(r,rows,group_history,id_weights,id_evidence)
             item=dict(id=ident,name=r.get('name'),rarity=r.get('tier') or '',
                       item_type=r.get('item_type') or '',subtype=r.get('subtype') or '',
                       quantity=r.get('amount') or 1,price_e=price_e(r),
@@ -185,6 +252,7 @@ def build(listings, previous, history, now):
                       listing_timestamp=r.get('timestamp'),listing_age_minutes=listing_age,
                       observed_age_minutes=observation_age,
                       category='unrated',fair_e=None,profit_e=None,roi=None,score=0,
+                      id_pricing={'method':'insufficient evidence','weighted_ids':[],'verified_sales':False},
                       confidence=None,stability='unknown',warnings=[])
             if analysis: item.update(analysis)
             # Without a trustworthy listing timestamp, freshness cannot be asserted.
@@ -242,14 +310,14 @@ def main():
         loot={'state':'available','data':pool}
     except (requests.RequestException,ValueError) as err:
         loot['note']=f'Lootpool lookup unavailable ({type(err).__name__})'
-    status={'version':'4','updated_at':now.isoformat(),'scanned':len(rows),'exported':len(output),
+    status={'version':'5','updated_at':now.isoformat(),'scanned':len(rows),'exported':len(output),
             'pages':page,'total_pages':total_pages,
             'complete':bool((total_pages and page>=int(total_pages)) or len(items)<page_size),
             'note':'Observed API listings, not confirmed in-game availability; timestamps may be missing.'}
     save(DATA/'observed.json', {'listings':seen})
     save(DATA/'history_v4.json',history)
     save(SITE/'market.json',{'status':status,'listings':output,'lootpool':loot})
-    print('Scan OK V4:',status['scanned'],'observed;',len(output),'exported;',status['complete'],'complete')
+    print('Scan OK V5:',status['scanned'],'observed;',len(output),'exported;',status['complete'],'complete')
 
 
 if __name__ == '__main__':main()
