@@ -192,89 +192,82 @@ def apply_baselines(items,baselines,session,key):
 
 
 def apply_unidentified_comparables(items, raw_rows):
-    """Conservative UNID-only comparisons from independent listing observations.
-
-    Never compare UNID items to identified or status-unknown offers. Compare
-    item name + tier + subtype + item_type + shiny status, and per-unit price.
-    Returns count of UNID prices populated (not confirmed sales).
-    """
-    pools=defaultdict(dict)
-    for row in raw_rows:
-        if identification_status(row) != 'unidentified':
-            continue
-        price=price_e(row)
-        if price is None or price <= 0:continue
-        key=(str(row.get('name') or '').casefold().strip(),str(row.get('tier') or '').casefold(),
-             str(row.get('item_type') or '').casefold(),str(row.get('subtype') or '').casefold(),
-             str(row.get('shiny_stat') or ''))
-        if not key[0]:continue
-        pools[key][identity(row)]=price
-    count=0
+    """Compute conservative UNID-only estimates from independent offers."""
+    count = 0
     for item in items:
-        if item.get('identification_status')!='unidentified':continue
-        key=(str(item.get('name') or '').casefold().strip(),str(item.get('rarity') or '').casefold(),
-             str(item.get('item_type') or '').casefold(),str(item.get('subtype') or '').casefold(),
-             str(item.get('shiny_stat') or ''))
-        unique=pools.get(key,{})
-        prices=sorted(p for ident,p in unique.items() if ident != item.get('id'))
-        # Three OTHER unique comparables required, avoiding a self-reference.
-        if len(prices)<3:continue
-        median=statistics.median(prices)
-        # Ignore extreme outliers and use the 35th percentile for conservative resale.
-        trimmed=[p for p in prices if .4*median<=p<=2.5*median]
-        if len(trimmed)<3:continue
-        idx=int((len(trimmed)-1)*.35)
-        reference_price=round(trimmed[idx]*.9)
-        if reference_price<=0:continue
-        buy=number(item.get('price_e'))
-        item.update(fair_e=reference_price,valuation_source='unid_comparables',
-                    comparables=len(trimmed),baseline_sample_count=len(trimmed),
+        if item.get('identification_status') != 'unidentified':
+            continue
+        offers = status_matched_offers(item, raw_rows)
+        prices = sorted(offers.values())
+        if len(prices) < 3:
+            continue
+        median = statistics.median(prices)
+        trimmed = sorted(p for p in prices if 0.4 * median <= p <= 2.5 * median)
+        if len(trimmed) < 3:
+            continue
+        reference_price = round(trimmed[int((len(trimmed) - 1) * 0.35)] * 0.9)
+        if reference_price <= 0:
+            continue
+        buy = number(item.get('price_e'))
+        item.update(fair_e=reference_price, valuation_source='unid_comparables',
+                    comparables=len(trimmed), baseline_sample_count=len(trimmed),
                     warnings=list(item.get('warnings') or []) +
-                    ['Compared only with separately observed unidentified copies; asking prices do not prove sales.'])
-        if buy and buy>0:
-            item['baseline_discount_pct']=round(100*(reference_price-buy)/reference_price,1)
-        count+=1
+                    ['UNID-only observed asking prices, not confirmed sales.'])
+        if buy and buy > 0:
+            item['baseline_discount_pct'] = round(100 * (reference_price - buy) / reference_price, 1)
+        count += 1
     return count
 
 
+def status_matched_offers(item, rows):
+    """Return distinct same-item, same-ID-status asking prices.
 
-def apply_status_matched_base_references(items, historical_rows):
-    """Fill *base references*, never roll-specific resale estimates.
-
-    Use distinct offers for exactly the same name, tier, type, subtype,
-    shiny variant, and identification status. Unknown status is excluded.
-    These are observed ASKING prices, not confirmed sale prices.
+    V12 archives store rarity in `tier`; other feeds can store it in
+    `rarity`, with `tier` blank. Missing rarity is not proof of a mismatch,
+    but explicit contradictory rarities are excluded. Unknown ID status
+    is never treated as UNID.
     """
-    pools = defaultdict(dict)
-    for row in historical_rows:
-        status = identification_status(row)
-        if status not in ('identified', 'unidentified'):
+    target_status = item.get('identification_status')
+    if target_status not in ('identified', 'unidentified'):
+        return {}
+    norm = lambda value: str(value or '').strip().casefold()
+    target_name = norm(item.get('name'))
+    target_tier = norm(item.get('rarity') or item.get('item_tier'))
+    target_type = norm(item.get('item_type'))
+    target_subtype = norm(item.get('subtype'))
+    target_shiny = norm(item.get('shiny_stat'))
+    own_id = str(item.get('id') or '')
+    result = {}
+    for row in rows:
+        if identification_status(row) != target_status:
+            continue
+        if norm(row.get('name')) != target_name or not target_name:
+            continue
+        if norm(row.get('item_type')) != target_type:
+            continue
+        if norm(row.get('subtype')) != target_subtype:
+            continue
+        if norm(row.get('shiny_stat')) != target_shiny:
+            continue
+        other_tier = norm(row.get('rarity') or row.get('tier'))
+        if target_tier and other_tier and target_tier != other_tier:
+            continue
+        unique_id = identity(row)
+        if unique_id == own_id:
             continue
         p = price_e(row)
-        if p is None or p <= 0:
-            continue
-        key = (str(row.get('name') or '').strip().casefold(),
-               str(row.get('tier') or '').strip().casefold(),
-               str(row.get('item_type') or '').strip().casefold(),
-               str(row.get('subtype') or '').strip().casefold(),
-               str(row.get('shiny_stat') or '').strip().casefold(), status)
-        if key[0]:
-            pools[key][identity(row)] = p
+        if p is not None and p > 0:
+            result[unique_id] = p
+    return result
 
+
+def apply_status_matched_base_references(items, historical_rows):
+    """Populate *general base references*, never roll-specific resale prices."""
     filled = 0
     for item in items:
         if item.get('fair_e') is not None:
             continue
-        status = item.get('identification_status')
-        if status not in ('identified', 'unidentified'):
-            continue
-        key = (str(item.get('name') or '').strip().casefold(),
-               str(item.get('rarity') or '').strip().casefold(),
-               str(item.get('item_type') or '').strip().casefold(),
-               str(item.get('subtype') or '').strip().casefold(),
-               str(item.get('shiny_stat') or '').strip().casefold(), status)
-        comparable = pools.get(key, {})
-        prices = sorted(v for ident, v in comparable.items() if ident != str(item.get('id')))
+        prices = sorted(status_matched_offers(item, historical_rows).values())
         if len(prices) < 3:
             continue
         med = statistics.median(prices)
@@ -293,7 +286,7 @@ def apply_status_matched_base_references(items, historical_rows):
         item['roi'] = None
         item['category'] = 'unrated'
         item['warnings'] = list(item.get('warnings') or []) + [
-            'Status-matched historical asking-price reference only. NOT a roll-adjusted resale estimate.'
+            'Same-item/status asking-price reference; NOT a roll-adjusted resale estimate.'
         ]
         filled += 1
     return filled
@@ -414,53 +407,30 @@ def apply_trade_costs(items):
 
 
 def add_tentative_price_ranges(items, historical_rows):
-    """Expose low-confidence same-status ASKING-price ranges, not sale predictions.
-
-    Never mingle identified, unidentified or unknown-status offers. Unique
-    listing identifiers prevent repeat scans from manufacturing sample size.
-    Identified gear is NOT roll-adjusted here. These ranges are excluded from
-    opportunity classifications and potential-profit calculations.
-    """
-    pools = defaultdict(dict)
-    for row in historical_rows:
-        status = identification_status(row)
-        if status not in ('identified', 'unidentified'):
-            continue
-        price = price_e(row)
-        if not price or price <= 0:
-            continue
-        key = (str(row.get('name') or '').strip().casefold(),
-               str(row.get('tier') or '').strip().casefold(),
-               str(row.get('item_type') or '').strip().casefold(),
-               str(row.get('subtype') or '').strip().casefold(),
-               str(row.get('shiny_stat') or '').strip().casefold(), status)
-        if key[0]:
-            pools[key][identity(row)] = round(price)
+    """Expose tentative same-status asking ranges, never implied resale profits."""
     count = 0
     for item in items:
         item['tentative_range_e'] = None
         item['tentative_sample_count'] = 0
         if item.get('resale_estimate_e') is not None:
             continue
-        status = item.get('identification_status')
-        if status not in ('identified', 'unidentified'):
+        offers = status_matched_offers(item, historical_rows)
+        if not offers:
             continue
-        key = (str(item.get('name') or '').strip().casefold(),
-               str(item.get('rarity') or '').strip().casefold(),
-               str(item.get('item_type') or '').strip().casefold(),
-               str(item.get('subtype') or '').strip().casefold(),
-               str(item.get('shiny_stat') or '').strip().casefold(), status)
-        own_id = str(item.get('id') or '')
-        prices = sorted(p for listing_id, p in pools.get(key, {}).items() if listing_id != own_id)
-        if not prices:
-            continue
-        # With only one comparable, show a reference point rather than a
-        # fabricated interval. With 2+, report the observed asking-price span.
+        prices = sorted(offers.values())
+        # For two+ independent offers exclude egregious outliers where possible.
+        if len(prices) >= 3:
+            median = statistics.median(prices)
+            trimmed = [p for p in prices if 0.4 * median <= p <= 2.5 * median]
+            if len(trimmed) >= 2:
+                prices = trimmed
         item['tentative_range_e'] = {'low': prices[0], 'high': prices[-1]}
         item['tentative_sample_count'] = len(prices)
-        item['tentative_range_kind'] = 'UNID-only historical asks' if status == 'unidentified' else 'identified same-item asks; rolls unadjusted'
+        item['tentative_range_kind'] = ('UNID-only historical asking prices' if item.get('identification_status') == 'unidentified'
+                                        else 'Same-item identified asks; rolls not adjusted')
         count += 1
     return count
+
 
 def fetch_market(key,session=None,limit_pages=5,page_size=100):
     session=session or requests.Session();rows=[];pages=None
