@@ -237,6 +237,68 @@ def apply_unidentified_comparables(items, raw_rows):
     return count
 
 
+
+def apply_status_matched_base_references(items, historical_rows):
+    """Fill *base references*, never roll-specific resale estimates.
+
+    Use distinct offers for exactly the same name, tier, type, subtype,
+    shiny variant, and identification status. Unknown status is excluded.
+    These are observed ASKING prices, not confirmed sale prices.
+    """
+    pools = defaultdict(dict)
+    for row in historical_rows:
+        status = identification_status(row)
+        if status not in ('identified', 'unidentified'):
+            continue
+        p = price_e(row)
+        if p is None or p <= 0:
+            continue
+        key = (str(row.get('name') or '').strip().casefold(),
+               str(row.get('tier') or '').strip().casefold(),
+               str(row.get('item_type') or '').strip().casefold(),
+               str(row.get('subtype') or '').strip().casefold(),
+               str(row.get('shiny_stat') or '').strip().casefold(), status)
+        if key[0]:
+            pools[key][identity(row)] = p
+
+    filled = 0
+    for item in items:
+        if item.get('fair_e') is not None:
+            continue
+        status = item.get('identification_status')
+        if status not in ('identified', 'unidentified'):
+            continue
+        key = (str(item.get('name') or '').strip().casefold(),
+               str(item.get('rarity') or '').strip().casefold(),
+               str(item.get('item_type') or '').strip().casefold(),
+               str(item.get('subtype') or '').strip().casefold(),
+               str(item.get('shiny_stat') or '').strip().casefold(), status)
+        comparable = pools.get(key, {})
+        prices = sorted(v for ident, v in comparable.items() if ident != str(item.get('id')))
+        if len(prices) < 3:
+            continue
+        med = statistics.median(prices)
+        filtered = sorted(v for v in prices if 0.4 * med <= v <= 2.5 * med)
+        if len(filtered) < 3:
+            continue
+        ref = round(filtered[int((len(filtered) - 1) * 0.35)])
+        if ref <= 0:
+            continue
+        buy = number(item.get('price_e'))
+        item['fair_e'] = ref
+        item['valuation_source'] = 'status_matched_base_only'
+        item['baseline_sample_count'] = len(filtered)
+        item['baseline_discount_pct'] = round(100 * (ref - buy) / ref, 1) if buy and buy > 0 else None
+        item['profit_e'] = None
+        item['roi'] = None
+        item['category'] = 'unrated'
+        item['warnings'] = list(item.get('warnings') or []) + [
+            'Status-matched historical asking-price reference only. NOT a roll-adjusted resale estimate.'
+        ]
+        filled += 1
+    return filled
+
+
 def augment(items,reference):
     # Transparent signals; no speculative claim of sales or profit/hour.
     groups=defaultdict(list)
@@ -349,7 +411,7 @@ def apply_trade_costs(items):
             item['price_kind'] = 'baseline_only' if fair else 'unknown'
     return items
 
-def fetch_market(key,session=None,limit_pages=5,page_size=100):
+def fetch_market(key,session=None,limit_pages=2,page_size=100):
     session=session or requests.Session();rows=[];pages=None
     for page in range(1,limit_pages+1):
         data=get_json(session,BASE+'/api/v2/market/listings',key,
@@ -370,6 +432,7 @@ def fetch_market(key,session=None,limit_pages=5,page_size=100):
     bases=dict(bases)
     n_lookup=0
     n_baseline,n_lookup=apply_baselines(items,bases,session,key)
+    matched_baselines=apply_status_matched_base_references(items,reference+historical_rows)
     augment(items,reference+historical_rows)
     configured=bool(os.environ.get('UPSTASH_REDIS_REST_URL') and os.environ.get('UPSTASH_REDIS_REST_TOKEN'))
     saved_count=None;history_write_error=None
@@ -389,7 +452,7 @@ def fetch_market(key,session=None,limit_pages=5,page_size=100):
        'reference_offers':len(reference),'durable_history_offers':history_total,'persistent_history':durable,
        'history_configured':configured,'history_read_error':history_read_error,
        'history_write_error':history_write_error,
-       'unidentified_resale_estimates':unid_estimates,'baseline_items':len(bases),'baseline_estimates':n_baseline,'baseline_source':source,
+       'unidentified_resale_estimates':unid_estimates,'baseline_items':len(bases),'baseline_estimates':n_baseline,'status_matched_base_estimates':matched_baselines,'baseline_source':source,
        'baseline_errors':errors,'individual_price_lookups':n_lookup,
        'low_value_suppressed':sum(bool(i.get('low_value_filtered')) for i in items),
        'roll_opportunities':sum(i.get('v12_signal')=='roll_opportunity' for i in items),
