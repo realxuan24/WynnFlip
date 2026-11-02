@@ -1,33 +1,648 @@
-<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>WynnFlip V3 — Market Explorer</title><style>
-:root{color-scheme:dark;--bg:#0b1120;--card:#131d31;--line:#2b3951;--text:#e8eefc;--muted:#9cadc6;--accent:#72c8f6;--good:#71d6ae;--warn:#e8c27f}*{box-sizing:border-box}body{margin:0;font:14px/1.5 system-ui,-apple-system,Segoe UI,sans-serif;background:var(--bg);color:var(--text)}main{max-width:1250px;margin:auto;padding:28px 20px}header{display:flex;align-items:center;justify-content:space-between;gap:20px;flex-wrap:wrap}h1{font-size:30px;margin:0}h2{font-size:18px;margin:0 0 12px}.muted,small{color:var(--muted)}.pill{padding:5px 10px;border-radius:20px;background:#25334b;color:var(--muted);display:inline-block}.cards{display:grid;grid-template-columns:repeat(5,1fr);gap:12px;margin:24px 0}.card,.panel{background:var(--card);border:1px solid var(--line);border-radius:14px;padding:16px}.card b{display:block;font-size:24px;margin:5px 0}.panel{margin:14px 0}.tools{display:flex;flex-wrap:wrap;gap:10px;margin:16px 0}input,select,button{font:inherit;color:var(--text);background:#0e1728;border:1px solid #43526c;border-radius:8px;padding:9px 11px}button{cursor:pointer}button.active{background:#205077;border-color:#68b3e0}input{min-width:230px;flex:1}table{width:100%;border-collapse:collapse;font-size:13px}th{text-align:left;color:var(--muted);font-weight:600}td,th{padding:11px;border-bottom:1px solid #2a3850;vertical-align:top}td{max-width:290px}tr:hover{background:#192942}.scroll{overflow:auto}.good{color:var(--good)}.warn{color:var(--warn)}.muted{color:var(--muted)}.right{text-align:right}.rolls{white-space:normal;max-width:330px;font-size:12px;color:var(--muted)}.tag{font-size:11px;padding:3px 7px;border:1px solid #42536a;border-radius:7px;display:inline-block}#error{color:#ffb8b8}#count{color:var(--muted)}.tabs{display:flex;gap:6px;flex-wrap:wrap}.hidden{display:none}details{max-width:400px}summary{cursor:pointer;color:var(--accent)}.foot{margin:20px 0;color:var(--muted);font-size:12px}@media(max-width:850px){.cards{grid-template-columns:repeat(2,1fr)}main{padding:15px}table{min-width:860px}}
-</style></head><body><main><header><div><h1>WynnFlip <span style="color:var(--accent)">V3</span></h1><div class="muted">Wynncraft market explorer · risk-aware analysis · observed asking prices</div></div><span class="pill" id="state">Loading market data…</span></header><div id="error" role="alert"></div>
-<div class="cards"><div class="card"><small>Listings observed</small><b id="scanned">—</b><small id="coverage">Coverage pending</small></div><div class="card"><small>Qualified</small><b id="qualified">—</b><small>Stricter confidence criteria</small></div><div class="card"><small>Potential</small><b id="potential">—</b><small>Research further</small></div><div class="card"><small>Watch / volatile</small><b id="watch">—</b><small>Higher uncertainty</small></div><div class="card"><small>Last scan (UTC)</small><b id="last" style="font-size:15px">—</b><small>Scheduled, not real-time</small></div></div>
-<div class="panel"><h2>Explore listings</h2><div class="tabs"><button data-category="all" class="active">All observed</button><button data-category="candidate">Qualified</button><button data-category="potential">Potential</button><button data-category="watch">Watch / volatile</button><button data-category="unrated">Unrated</button></div><div class="tools"><input id="search" placeholder="Search item name…" aria-label="Search items"><select id="rarity" aria-label="Rarity"><option value="">All rarities</option></select><select id="type" aria-label="Item type"><option value="">All types</option></select><select id="sort" aria-label="Sort"><option value="score">Best risk-adjusted score</option><option value="profit">Highest potential profit</option><option value="roi">Highest potential ROI</option><option value="priceAsc">Lowest listing price</option><option value="priceDesc">Highest listing price</option><option value="name">Name (A–Z)</option></select><select id="currency" aria-label="Currency display"><option value="both">Decimal LE + exact</option><option value="exact">LE / EB / E</option><option value="emerald">Emeralds only</option></select></div><div class="muted" id="count">Loading…</div><div class="scroll"><table><thead><tr><th>Item / status</th><th>Asking price</th><th>Conservative resale estimate</th><th>Potential profit</th><th>ROI / risk</th><th>Rolls</th></tr></thead><tbody id="rows"></tbody></table></div><div class="tools" style="justify-content:flex-end"><button id="prev">Previous</button><span class="muted" id="page"></span><button id="next">Next</button></div></div>
-<div class="panel"><h2>Lootpool data</h2><p class="muted" id="loot">Waiting for available lootpool information…</p><div id="lootcontent"></div></div>
-<p class="foot">1 LE = 64 EB = 4,096 emeralds. Estimated resale values are conservative heuristics based on observed asking prices—not verified sales. API coverage may be incomplete, listings may have sold, and confidence is not a probability of profit. No trades are made automatically.</p></main><script>
-const $=id=>document.getElementById(id);let all=[],filtered=[],currentPage=0,category='all';const PER_PAGE=40;
-function el(tag,cls,txt){let x=document.createElement(tag);if(cls)x.className=cls;if(txt!==undefined)x.textContent=String(txt);return x}
 
-function money(value) {
-  if (value === null || value === undefined ||
-      !Number.isSafeInteger(Number(value))) return "—";
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>WynnFlip V3 — Market Explorer</title>
 
-  const n = Number(value);
-  const sign = n < 0 ? "−" : "";
-  const e = Math.abs(n);
-
-  const le = Math.floor(e / 4096);
-  const eb = Math.floor((e % 4096) / 64);
-  const rem = e % 64;
-
-  const emeralds = e.toLocaleString("en-US") + " Emeralds";
-  const exact = `${le} LE ${eb} EB ${rem} E`;
-
-  return `${sign}${emeralds}\n${sign}${exact}`;
+<style>
+:root {
+  color-scheme: dark;
+  --bg: #0b1120;
+  --card: #131d31;
+  --line: #2b3951;
+  --text: #e8eefc;
+  --muted: #9cadc6;
+  --accent: #72c8f6;
+  --good: #71d6ae;
+  --warn: #e8c27f;
 }
 
-function textCell(tr,text,cls=''){let td=el('td',cls,text);tr.appendChild(td);return td}
-function render(){let q=$('search').value.trim().toLowerCase(),rarity=$('rarity').value,t=$('type').value;filtered=all.filter(x=>(category==='all'||x.category===category)&&(x.name||'').toLowerCase().includes(q)&&(!rarity||x.rarity===rarity)&&(!t||x.item_type===t));const sorter=$('sort').value;filtered.sort((a,b)=>sorter==='priceAsc'?(a.price_e-b.price_e):sorter==='priceDesc'?(b.price_e-a.price_e):sorter==='name'?(a.name||'').localeCompare(b.name||''):sorter==='profit'?(b.profit_e||0)-(a.profit_e||0):sorter==='roi'?(b.roi||0)-(a.roi||0):(b.score||0)-(a.score||0));let total=Math.max(1,Math.ceil(filtered.length/PER_PAGE));currentPage=Math.min(currentPage,total-1);$('page').textContent=`Page ${currentPage+1} / ${total}`;$('count').textContent=`${filtered.length.toLocaleString()} listings match · showing up to ${PER_PAGE} per page`;$('prev').disabled=currentPage===0;$('next').disabled=currentPage>=total-1;const tbody=$('rows');tbody.replaceChildren();for(const x of filtered.slice(currentPage*PER_PAGE,(currentPage+1)*PER_PAGE)){const tr=el('tr');let name=textCell(tr,'');name.append(el('strong','',x.name||'Unknown item'),el('div','muted',(x.rarity||'')+' · '+(x.subtype||x.item_type||'')+' · x'+(x.quantity||1)),el('span','tag',x.category||'unrated'));textCell(tr,money(x.price_e));textCell(tr,money(x.fair_e));let p=textCell(tr,money(x.profit_e));if((x.profit_e||0)>0)p.className='good';let info=textCell(tr,'');info.append(el('div','',x.roi==null?'No estimate':`${x.roi}% ROI`),el('div','muted',x.confidence==null?'Confidence unavailable':`Confidence: ${Math.round(100*x.confidence)}%`),el('div','muted',x.stability||'Unknown stability'));if((x.warnings||[]).length)info.append(el('div','warn',x.warnings.join(' · ')));let r=textCell(tr,'');const roll=x.stat_rolls||{};const keys=Object.keys(roll);r.append(el('div','',x.overall_roll==null?'Overall roll: —':`Overall roll: ${x.overall_roll}%`));if(keys.length){let d=el('details');d.append(el('summary','',`${keys.length} individual rolls`));d.append(el('div','rolls',keys.map(k=>k+': '+roll[k]).join(' · ')));r.append(d)}tbody.append(tr)}if(!filtered.length){const tr=el('tr');const td=el('td','muted','No listings match these filters. Try “All observed” or clear your search.');td.colSpan=6;tr.append(td);tbody.append(tr)}}
-async function main(){try{let r=await fetch('./market.json?ts='+Date.now(),{cache:'no-store'});if(!r.ok)throw Error('market.json returned HTTP '+r.status);let d=await r.json();const status=d.status||{};all=Array.isArray(d.listings)?d.listings:[];$('state').textContent=`V${status.version||'3'} · ${status.complete?'Scan complete':'Partial coverage'}`;$('scanned').textContent=(status.scanned??all.length).toLocaleString();$('coverage').textContent=`${status.pages||'?'} pages · ${status.complete?'complete':'partial scan'}`;$('qualified').textContent=status.candidates??all.filter(x=>x.category==='candidate').length;$('potential').textContent=status.potential??all.filter(x=>x.category==='potential').length;$('watch').textContent=status.watch??all.filter(x=>x.category==='watch').length;$('last').textContent=status.updated_at?new Date(status.updated_at).toLocaleString('en-GB',{timeZone:'UTC'}):'Unknown';for(const [id,key] of [['rarity','rarity'],['type','item_type']]){let values=[...new Set(all.map(x=>x[key]).filter(Boolean))].sort();for(let v of values){let o=el('option','',v);o.value=v;$(id).append(o)}}const pool=d.lootpool||{};$('loot').textContent=pool.state==='available'?'Current lootpool data retrieved (supply indicator, not a price forecast).':(pool.note||'Lootpool data unavailable or no API permission.');if(pool.state==='available'){$('lootcontent').append(el('pre','muted',JSON.stringify(pool.data??{},null,2).slice(0,14000)))}render()}catch(e){$('state').textContent='Data unavailable';$('error').textContent='Unable to load market.json: '+e.message;$('count').textContent='No market data loaded.'}}
-for(let id of ['search','rarity','type','sort','currency'])$(id).addEventListener(id==='search'?'input':'change',()=>{currentPage=0;render()});document.querySelectorAll('button[data-category]').forEach(b=>b.onclick=()=>{category=b.dataset.category;document.querySelectorAll('button[data-category]').forEach(x=>x.classList.toggle('active',x===b));currentPage=0;render()});$('prev').onclick=()=>{currentPage--;render()};$('next').onclick=()=>{currentPage++;render()};main();
-</script></body></html>
+* { box-sizing: border-box; }
+
+body {
+  margin: 0;
+  font: 14px/1.5 system-ui, sans-serif;
+  background: var(--bg);
+  color: var(--text);
+}
+
+main {
+  max-width: 1320px;
+  margin: auto;
+  padding: 28px 20px;
+}
+
+header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 20px;
+  flex-wrap: wrap;
+}
+
+h1 { font-size: 30px; margin: 0; }
+h2 { font-size: 18px; margin: 0 0 12px; }
+
+.muted, small { color: var(--muted); }
+
+.pill {
+  padding: 5px 10px;
+  border-radius: 20px;
+  background: #25334b;
+  color: var(--muted);
+  display: inline-block;
+}
+
+.cards {
+  display: grid;
+  grid-template-columns: repeat(5, 1fr);
+  gap: 12px;
+  margin: 24px 0;
+}
+
+.card, .panel {
+  background: var(--card);
+  border: 1px solid var(--line);
+  border-radius: 14px;
+  padding: 16px;
+}
+
+.card b {
+  display: block;
+  font-size: 24px;
+  margin: 5px 0;
+}
+
+.panel { margin: 14px 0; }
+
+.tools, .tabs {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+  margin: 16px 0;
+}
+
+input, select, button {
+  font: inherit;
+  color: var(--text);
+  background: #0e1728;
+  border: 1px solid #43526c;
+  border-radius: 8px;
+  padding: 9px 11px;
+}
+
+button { cursor: pointer; }
+
+button.active {
+  background: #205077;
+  border-color: #68b3e0;
+}
+
+button:disabled {
+  opacity: .4;
+  cursor: not-allowed;
+}
+
+input {
+  min-width: 230px;
+  flex: 1;
+}
+
+.scroll { overflow-x: auto; }
+
+table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 13px;
+  min-width: 1050px;
+}
+
+th {
+  text-align: left;
+  color: var(--muted);
+  font-weight: 600;
+}
+
+th, td {
+  padding: 13px 12px;
+  border-bottom: 1px solid #2a3850;
+  vertical-align: top;
+}
+
+tr:hover { background: #192942; }
+
+.name {
+  font-weight: 700;
+  font-size: 14px;
+}
+
+.price {
+  min-width: 160px;
+  font-variant-numeric: tabular-nums;
+}
+
+.price-main {
+  display: block;
+  font-size: 15px;
+  font-weight: 700;
+  white-space: nowrap;
+}
+
+.price-exact {
+  display: block;
+  color: var(--muted);
+  font-size: 12px;
+  margin-top: 4px;
+  white-space: nowrap;
+}
+
+.price.positive .price-main {
+  color: var(--good);
+}
+
+.good { color: var(--good); }
+.warn { color: var(--warn); }
+
+.tag {
+  display: inline-block;
+  padding: 3px 7px;
+  border: 1px solid #42536a;
+  border-radius: 7px;
+  font-size: 11px;
+  margin-top: 5px;
+}
+
+.rolls {
+  max-width: 330px;
+  font-size: 12px;
+  color: var(--muted);
+  overflow-wrap: anywhere;
+}
+
+details { max-width: 400px; }
+summary { cursor: pointer; color: var(--accent); }
+
+#error { color: #ffb8b8; }
+
+.foot {
+  margin: 20px 0;
+  color: var(--muted);
+  font-size: 12px;
+}
+
+@media(max-width: 850px) {
+  .cards { grid-template-columns: repeat(2, 1fr); }
+  main { padding: 15px; }
+}
+
+@media(max-width: 450px) {
+  .card { padding: 11px; }
+  .card b { font-size: 20px; }
+}
+</style>
+</head>
+
+<body>
+<main>
+
+<header>
+  <div>
+    <h1>WynnFlip <span style="color:var(--accent)">V3</span></h1>
+    <div class="muted">
+      Wynncraft Market Explorer · Risk-Aware Analysis
+    </div>
+  </div>
+  <span class="pill" id="state">Loading market data...</span>
+</header>
+
+<div id="error" role="alert"></div>
+
+<section class="cards">
+  <div class="card">
+    <small>Listings Observed</small>
+    <b id="scanned">—</b>
+    <small id="coverage">Coverage pending</small>
+  </div>
+  <div class="card">
+    <small>Qualified Deals</small>
+    <b id="qualified">—</b>
+    <small>Higher-confidence candidates</small>
+  </div>
+  <div class="card">
+    <small>Potential Deals</small>
+    <b id="potential">—</b>
+    <small>Research further</small>
+  </div>
+  <div class="card">
+    <small>Watch / Volatile</small>
+    <b id="watch">—</b>
+    <small>Higher uncertainty</small>
+  </div>
+  <div class="card">
+    <small>Last Scan (UTC)</small>
+    <b id="last" style="font-size:15px">—</b>
+    <small>Scheduled, not real-time</small>
+  </div>
+</section>
+
+<section class="panel">
+  <h2>Market Explorer</h2>
+
+  <div class="tabs">
+    <button data-category="all" class="active">All Observed</button>
+    <button data-category="candidate">Qualified</button>
+    <button data-category="potential">Potential</button>
+    <button data-category="watch">Watch / Volatile</button>
+    <button data-category="unrated">Unrated</button>
+  </div>
+
+  <div class="tools">
+    <input id="search" placeholder="Search item name...">
+
+    <select id="rarity">
+      <option value="">All rarities</option>
+    </select>
+
+    <select id="type">
+      <option value="">All item types</option>
+    </select>
+
+    <select id="sort">
+      <option value="score">Best risk-adjusted score</option>
+      <option value="profit">Highest potential profit</option>
+      <option value="roi">Highest potential ROI</option>
+      <option value="priceAsc">Lowest asking price</option>
+      <option value="priceDesc">Highest asking price</option>
+      <option value="name">Name A–Z</option>
+    </select>
+  </div>
+
+  <div id="count" class="muted">Loading listings...</div>
+
+  <div class="scroll">
+    <table>
+      <thead>
+        <tr>
+          <th>Item / Status</th>
+          <th>Asking Price</th>
+          <th>Conservative Resale</th>
+          <th>Potential Profit</th>
+          <th>ROI / Risk</th>
+          <th>Identification Rolls</th>
+        </tr>
+      </thead>
+      <tbody id="rows"></tbody>
+    </table>
+  </div>
+
+  <div class="tools" style="justify-content:flex-end">
+    <button id="prev">Previous</button>
+    <span class="muted" id="page"></span>
+    <button id="next">Next</button>
+  </div>
+</section>
+
+<section class="panel">
+  <h2>Lootpool Intelligence</h2>
+  <p class="muted" id="loot">
+    Loading lootpool information...
+  </p>
+  <div id="lootcontent"></div>
+</section>
+
+<p class="foot">
+  1 LE = 64 EB = 4,096 Emeralds.
+  All listing prices are displayed in exact emerald values.
+  Estimated resale values may be rounded to the nearest emerald for display.
+  WynnFlip uses observed asking prices, not verified completed sales.
+  Listings may be outdated and profits are not guaranteed.
+</p>
+
+</main>
+
+<script>
+const $ = id => document.getElementById(id);
+
+let all = [];
+let filtered = [];
+let currentPage = 0;
+let category = "all";
+
+const PER_PAGE = 40;
+const EMERALDS_PER_LE = 4096;
+const EMERALDS_PER_EB = 64;
+
+function el(tag, cls = "", text) {
+  const element = document.createElement(tag);
+  if (cls) element.className = cls;
+  if (text !== undefined) element.textContent = String(text);
+  return element;
+}
+
+/* Exact currency display */
+function formatMoney(value) {
+  if (value === null || value === undefined) return null;
+
+  const n = Number(value);
+  if (!Number.isFinite(n) || !Number.isSafeInteger(n)) return null;
+
+  const sign = n < 0 ? "−" : "";
+  const absolute = Math.abs(n);
+
+  const le = Math.floor(absolute / EMERALDS_PER_LE);
+  const eb = Math.floor((absolute % EMERALDS_PER_LE) / EMERALDS_PER_EB);
+  const e = absolute % EMERALDS_PER_EB;
+
+  return {
+    primary: sign + absolute.toLocaleString("en-US") + " Emeralds",
+    secondary: sign + `${le} LE ${eb} EB ${e} E`
+  };
+}
+
+function priceCell(tr, value, positive = false, estimate = false) {
+  const td = el("td", "price" + (positive ? " positive" : ""));
+  const price = formatMoney(value);
+
+  if (!price) {
+    td.textContent = "—";
+  } else {
+    td.append(
+      el("span", "price-main", price.primary),
+      el("span", "price-exact", price.secondary)
+    );
+
+    if (estimate) {
+      td.append(el("small", "muted", "Estimated"));
+    }
+  }
+
+  tr.appendChild(td);
+  return td;
+}
+
+function textCell(tr, text, cls = "") {
+  const td = el("td", cls, text);
+  tr.appendChild(td);
+  return td;
+}
+
+function render() {
+  const q = $("search").value.trim().toLowerCase();
+  const rarity = $("rarity").value;
+  const type = $("type").value;
+
+  filtered = all.filter(x =>
+    (category === "all" || x.category === category) &&
+    (x.name || "").toLowerCase().includes(q) &&
+    (!rarity || x.rarity === rarity) &&
+    (!type || x.item_type === type)
+  );
+
+  const sort = $("sort").value;
+
+  function num(v, fallback = 0) {
+    const n = Number(v);
+    return Number.isFinite(n) ? n : fallback;
+  }
+
+  filtered.sort((a, b) => {
+    if (sort === "priceAsc")
+      return num(a.price_e) - num(b.price_e);
+
+    if (sort === "priceDesc")
+      return num(b.price_e) - num(a.price_e);
+
+    if (sort === "name")
+      return (a.name || "").localeCompare(b.name || "");
+
+    if (sort === "profit")
+      return num(b.profit_e) - num(a.profit_e);
+
+    if (sort === "roi")
+      return num(b.roi) - num(a.roi);
+
+    return num(b.score) - num(a.score);
+  });
+
+  const pages = Math.max(1, Math.ceil(filtered.length / PER_PAGE));
+  currentPage = Math.min(currentPage, pages - 1);
+
+  $("page").textContent = `Page ${currentPage + 1} / ${pages}`;
+  $("count").textContent =
+    `${filtered.length.toLocaleString()} listings match · ${PER_PAGE} per page`;
+
+  $("prev").disabled = currentPage === 0;
+  $("next").disabled = currentPage >= pages - 1;
+
+  const tbody = $("rows");
+  tbody.replaceChildren();
+
+  const start = currentPage * PER_PAGE;
+  const visible = filtered.slice(start, start + PER_PAGE);
+
+  for (const x of visible) {
+    const tr = el("tr");
+
+    const name = textCell(tr, "");
+
+    name.append(
+      el("div", "name", x.name || "Unknown item"),
+      el("div", "muted",
+        `${x.rarity || ""} · ${x.subtype || x.item_type || ""} · x${x.quantity || 1}`
+      ),
+      el("span", "tag", x.category || "unrated")
+    );
+
+    priceCell(tr, x.price_e);
+    priceCell(tr, x.fair_e, false, true);
+    priceCell(tr, x.profit_e, Number(x.profit_e) > 0, true);
+
+    const info = textCell(tr, "");
+
+    info.append(
+      el("div", "",
+        x.roi == null ? "No ROI estimate" : `${x.roi}% ROI`
+      ),
+      el("div", "muted",
+        x.confidence == null
+          ? "Confidence unavailable"
+          : `Confidence: ${Math.round(x.confidence * 100)}%`
+      ),
+      el("div", "muted", x.stability || "Unknown stability")
+    );
+
+    if (Array.isArray(x.warnings) && x.warnings.length) {
+      info.append(el("div", "warn", x.warnings.join(" · ")));
+    }
+
+    const rollTd = textCell(tr, "");
+    const rolls = x.stat_rolls || {};
+    const keys = Object.keys(rolls);
+
+    rollTd.append(
+      el("div", "",
+        x.overall_roll == null
+          ? "Overall roll: —"
+          : `Overall roll: ${x.overall_roll}%`
+      )
+    );
+
+    if (keys.length) {
+      const detail = el("details");
+      detail.append(
+        el("summary", "", `${keys.length} individual rolls`)
+      );
+
+      const list = el("div", "rolls");
+
+      for (const key of keys) {
+        list.append(
+          el("div", "", `${key}: ${rolls[key]}`)
+        );
+      }
+
+      detail.append(list);
+      rollTd.append(detail);
+    }
+
+    tbody.appendChild(tr);
+  }
+
+  if (!visible.length) {
+    const tr = el("tr");
+    const td = el("td", "muted",
+      "No listings match these filters. Try All Observed."
+    );
+    td.colSpan = 6;
+    tr.appendChild(td);
+    tbody.appendChild(tr);
+  }
+}
+
+async function main() {
+  try {
+    const response = await fetch(
+      "./market.json?ts=" + Date.now(),
+      { cache: "no-store" }
+    );
+
+    if (!response.ok) {
+      throw new Error("market.json returned HTTP " + response.status);
+    }
+
+    const data = await response.json();
+    const status = data.status || {};
+
+    all = Array.isArray(data.listings) ? data.listings : [];
+
+    $("state").textContent =
+      `V${status.version || "3"} · ` +
+      (status.complete ? "Scan complete" : "Partial coverage");
+
+    $("scanned").textContent =
+      (status.scanned ?? all.length).toLocaleString();
+
+    $("coverage").textContent =
+      `${status.pages || "?"} pages · ` +
+      (status.complete ? "Complete scan" : "Partial scan");
+
+    $("qualified").textContent =
+      all.filter(x => x.category === "candidate").length;
+
+    $("potential").textContent =
+      all.filter(x => x.category === "potential").length;
+
+    $("watch").textContent =
+      all.filter(x => x.category === "watch").length;
+
+    $("last").textContent = status.updated_at
+      ? new Date(status.updated_at).toLocaleString(
+          "en-GB", { timeZone: "UTC" }
+        )
+      : "Unknown";
+
+    for (const [id, key] of [
+      ["rarity", "rarity"],
+      ["type", "item_type"]
+    ]) {
+      const values = [
+        ...new Set(all.map(x => x[key]).filter(Boolean))
+      ].sort();
+
+      for (const value of values) {
+        const option = el("option", "", value);
+        option.value = value;
+        $(id).appendChild(option);
+      }
+    }
+
+    const pool = data.lootpool || {};
+
+    $("loot").textContent =
+      pool.state === "available"
+        ? "Current lootpool data retrieved. This is a supply indicator, not a guaranteed price forecast."
+        : (pool.note || "Lootpool data unavailable.");
+
+    if (pool.state === "available") {
+      const pre = el("pre", "muted");
+
+      pre.style.whiteSpace = "pre-wrap";
+      pre.style.overflowWrap = "anywhere";
+
+      pre.textContent = JSON.stringify(
+        pool.data ?? {}, null, 2
+      ).slice(0, 14000);
+
+      $("lootcontent").appendChild(pre);
+    }
+
+    render();
+
+  } catch (error) {
+    $("state").textContent = "Data unavailable";
+    $("error").textContent =
+      "Unable to load market.json: " + error.message;
+    $("count").textContent = "No market data loaded.";
+  }
+}
+
+for (const id of ["search", "rarity", "type", "sort"]) {
+  $(id).addEventListener(
+    id === "search" ? "input" : "change",
+    () => {
+      currentPage = 0;
+      render();
+    }
+  );
+}
+
+document.querySelectorAll("button[data-category]").forEach(button => {
+  button.onclick = () => {
+    category = button.dataset.category;
+
+    document.querySelectorAll("button[data-category]").forEach(b => {
+      b.classList.toggle("active", b === button);
+    });
+
+    currentPage = 0;
+    render();
+  };
+});
+
+$("prev").onclick = () => {
+  currentPage = Math.max(0, currentPage - 1);
+  render();
+};
+
+$("next").onclick = () => {
+  currentPage++;
+  render();
+};
+
+main();
+</script>
+
+</body>
+</html>
