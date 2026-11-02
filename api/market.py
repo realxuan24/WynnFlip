@@ -7,7 +7,20 @@ from urllib.parse import quote
 import requests
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import FileResponse, JSONResponse
-from scanner import build, extract_listing_page, load_profiles, number, identification_status, identity, price_e
+from scanner import build, extract_listing_page, load_profiles, number, identification_status, identity
+import scanner as _scanner
+
+def price_e(row):
+    """WynnVentory listing_price is a per-item ask, not a stack total.
+
+    Do not divide by amount; that is quantity, not a divisor for price.
+    """
+    p = number(row.get('listing_price'))
+    return round(p) if p is not None and p > 0 else None
+
+# build() resolves this helper through the scanner module at execution time.
+# Keep the deployed scanner.py file untouched.
+_scanner.price_e = price_e
 
 BASE = 'https://wynnventory.com'
 ROOT = Path(__file__).resolve().parent.parent
@@ -454,7 +467,7 @@ def suppress_trivial_leads(items):
     """Keep cheap/bulk listings searchable, but not in the flip board.
 
     Guard against misleading percentage discounts on near-zero-value items.
-    Price is the total listing price, so evaluate cost per unit as well.
+    The listing price is per unit; never divide by quantity.
     """
     min_total = 4096  # One liquid emerald (LE), adjustable through an env var.
     try:
@@ -464,7 +477,7 @@ def suppress_trivial_leads(items):
     for item in items:
         price = number(item.get('price_e')) or 0
         qty = number(item.get('quantity')) or 1
-        per_unit = price / max(1, qty)
+        per_unit = price
         name = str(item.get('name', '')).casefold().strip()
         trivial = price < min_total or per_unit <= 64
         # Common bulk consumable: even a large stack doesn't merit an
@@ -499,16 +512,20 @@ def apply_trade_costs(items):
         fair = number(item.get('fair_e'))
         item['market_buyer_fee_pct'] = 5.0
         item['price_assumption'] = 'buyer_inclusive' if prices_include_tax else 'seller_ask'
-        item['purchase_total_e'] = (round(buy) if prices_include_tax else round(buy * (1 + fee))) if buy and buy > 0 else None
+        qty = max(1, int(number(item.get('quantity')) or 1))
+        item['unit_price_e'] = round(buy) if buy and buy > 0 else None
+        item['stack_total_e'] = round(buy * qty) if buy and buy > 0 else None
+        item['purchase_total_e'] = (round(buy * qty) if prices_include_tax else round(buy * qty * (1 + fee))) if buy and buy > 0 else None
         if item.get('valuation_source') in ('roll_comparables','unid_comparables') and fair and buy and buy > 0:
             # If the reference includes the fee charged to the resale buyer,
             # subtract that fee to estimate what the seller receives.
-            resale_take_home = round(fair / (1 + fee)) if prices_include_tax else round(fair)
+            resale_take_home = round(fair * qty / (1 + fee)) if prices_include_tax else round(fair * qty)
             purchase_total = item['purchase_total_e']
             possible = resale_take_home - purchase_total
-            item['resale_estimate_e'] = round(fair)
+            item['resale_estimate_e'] = round(fair)  # per unit, like historical comparisons
+            item['resale_stack_total_e'] = round(fair * qty)
             item['resale_take_home_e'] = resale_take_home
-            item['selling_transaction_fee_e'] = max(0, round(fair) - resale_take_home) if prices_include_tax else 0
+            item['selling_transaction_fee_e'] = max(0, round(fair * qty) - resale_take_home) if prices_include_tax else 0
             item['potential_net_profit_e'] = possible
             item['potential_net_roi_pct'] = round(100 * possible / purchase_total, 1) if purchase_total else None
             item['price_kind'] = 'unidentified_asking_reference' if item.get('valuation_source')=='unid_comparables' else 'conservative_roll_asking_reference'
@@ -519,6 +536,7 @@ def apply_trade_costs(items):
             item['potential_net_profit_e'] = None
             item['potential_net_roi_pct'] = None
             item['resale_estimate_e'] = None
+            item['resale_stack_total_e'] = None
             item['resale_take_home_e'] = None
             item['selling_transaction_fee_e'] = None
             item['price_kind'] = 'baseline_only' if fair else 'unknown'
@@ -647,7 +665,7 @@ def fetch_market(key,session=None,limit_pages=5,page_size=100):
     assess_sellability(items,rows,reference+historical_rows)
     mark_observation_freshness(items,now)
     items.sort(key=lambda x:x.get('listing_age_minutes') if x.get('listing_age_minutes') is not None else 1e10)
-    return {'status':{'version':'13.2','updated_at':now.isoformat(),'scanned':len(rows),'exported':len(items),
+    return {'status':{'version':'13.3','updated_at':now.isoformat(),'scanned':len(rows),'exported':len(items),
        'recent_observations':sum(i.get('observation_freshness')=='recent' for i in items),
        'verification_needed':sum(i.get('observation_freshness')=='verify' for i in items),
        'stale_or_unknown':sum(i.get('observation_freshness') in ('stale','unknown') for i in items),
@@ -675,7 +693,7 @@ def fetch_market(key,session=None,limit_pages=5,page_size=100):
 
 @app.get('/api/health')
 def health():
-    return {'version':'13.2','key_configured':bool(os.getenv('WYNNVENTORY_API_KEY')),
+    return {'version':'13.3','key_configured':bool(os.getenv('WYNNVENTORY_API_KEY')),
             'persistent_history_configured':bool(os.getenv('UPSTASH_REDIS_REST_URL') and os.getenv('UPSTASH_REDIS_REST_TOKEN'))}
 
 @app.get('/api/market')
