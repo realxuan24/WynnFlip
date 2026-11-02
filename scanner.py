@@ -391,7 +391,7 @@ def build(listings, previous, history, now, profiles=None):
 def extract_listing_page(payload):
     if isinstance(payload,list):return payload, None
     if not isinstance(payload,dict):raise ValueError('Unexpected listing response')
-    rows=payload.get('listings') or payload.get('data') or payload.get('results') or []
+    rows=payload.get('listings') or payload.get('items') or payload.get('data') or payload.get('results') or []
     if isinstance(rows,dict):rows=rows.get('listings') or rows.get('items') or []
     if not isinstance(rows,list):raise ValueError('No listing array found')
     pagination=payload.get('pagination') or payload.get('meta') or {}
