@@ -16,7 +16,7 @@ SITE = ROOT / "site"
 app = FastAPI(docs_url=None, redoc_url=None, openapi_url=None)
 
 
-def fetch_market(key, session=None, limit_pages=1, page_size=1000):
+def fetch_market(key, session=None, limit_pages=2, page_size=100):
     session = session or requests.Session()
     rows = []
     total_pages = None
