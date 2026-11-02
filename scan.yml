@@ -1,0 +1,44 @@
+name: WynnFlip Market Scan
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '7,37 * * * *'
+permissions:
+  contents: write
+concurrency:
+  group: wynnflip-scanner
+  cancel-in-progress: false
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+      - name: Scan and analyze market
+        env:
+          WYNNVENTORY_API_KEY: ${{ secrets.WYNNVENTORY_API_KEY }}
+          MAX_PAGES: '20'
+          MIN_PROFIT_LE: '0.5'
+          MIN_ROI_PERCENT: '25'
+          MIN_CONFIDENCE: '0.45'
+        run: python scanner.py
+      - name: Commit market observations
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add data/ site/market.json
+          if ! git diff --cached --quiet; then
+            git commit -m 'WynnFlip V2 market update'
+            git push
+          fi
+      - name: Export website
+        uses: actions/upload-artifact@v4
+        with:
+          name: wynnflip-dashboard
+          path: site/
+          retention-days: 7
