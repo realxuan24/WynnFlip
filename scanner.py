@@ -1,5 +1,5 @@
-"""WynnFlip V3: public-data market explorer and cautious deal screening.
-All source prices are emerald integers; no player automation or trading.
+"""WynnFlip V4: scheduled, read-only WynnVentory market observer.
+Listing presence is NOT proof of in-game availability.
 """
 import hashlib
 import json
@@ -8,7 +8,7 @@ import os
 import statistics
 import time
 from collections import defaultdict
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from pathlib import Path
 
 import requests
@@ -19,232 +19,236 @@ SITE = Path('site')
 LE = 4096
 
 
-def read(path, default):
+def load(path, fallback):
     try:
-        return json.loads(path.read_text('utf-8'))
+        return json.loads(path.read_text(encoding='utf-8'))
     except (OSError, ValueError):
-        return default
+        return fallback
 
 
-def write(path, value):
+def save(path, obj):
     path.parent.mkdir(parents=True, exist_ok=True)
     temp = path.with_suffix(path.suffix + '.tmp')
-    temp.write_text(json.dumps(value, ensure_ascii=False, separators=(',', ':'), allow_nan=False), encoding='utf-8')
+    temp.write_text(json.dumps(obj, ensure_ascii=False, separators=(',', ':')), encoding='utf-8')
     temp.replace(path)
 
 
-def get(session, path, key, params=None):
+def get(session, endpoint, key, params=None):
     for attempt in range(4):
-        resp = session.get(API + path, headers={'X-API-Key': key}, params=params, timeout=35)
-        if resp.status_code in (429, 500, 502, 503, 504) and attempt < 3:
+        r = session.get(API + endpoint, headers={'X-API-Key': key}, params=params, timeout=35)
+        if r.status_code in (429, 500, 502, 503, 504) and attempt < 3:
             time.sleep(3 * (attempt + 1))
             continue
-        resp.raise_for_status()
-        return resp.json()
+        r.raise_for_status()
+        return r.json()
 
 
-def number(v):
+def number(value, default=None):
     try:
-        f = float(v)
-        return f if math.isfinite(f) else None
-    except (TypeError, ValueError):
+        n = float(value)
+        return n if math.isfinite(n) else default
+    except (ValueError, TypeError):
+        return default
+
+
+def price_e(row):
+    amount = number(row.get('listing_price'))
+    quantity = number(row.get('amount'), 1)
+    if amount is None or amount <= 0 or not quantity or quantity <= 0:
         return None
+    return round(amount / quantity)
 
 
-def int_emeralds(v):
-    n = number(v)
-    if n is None or n < 0 or not n.is_integer():
-        return None
-    return int(n)
-
-
-def unit_price(row):
-    total = int_emeralds(row.get('listing_price'))
-    count = number(row.get('amount')) or 1
-    if total is None or count <= 0:
-        return None
-    # Market may list stacks. Express unit price as a floating reference only.
-    return total / count
+def identity(row):
+    if row.get('hash_code'):
+        return str(row['hash_code'])
+    # Fallback is not a guaranteed unique trade-market listing identity.
+    keys = ('name', 'listing_price', 'amount', 'timestamp', 'stat_rolls', 'overall_roll', 'tier')
+    canonical = json.dumps([row.get(k) for k in keys], sort_keys=True, default=str)
+    return hashlib.sha256(canonical.encode()).hexdigest()[:24]
 
 
 def variant(row):
-    return '|'.join(str(row.get(k) if row.get(k) is not None else '').lower() for k in
+    return '|'.join(str(row.get(k) or '').lower() for k in
                     ('name', 'item_type', 'subtype', 'tier', 'unidentified', 'shiny_stat'))
 
 
-def listing_id(row):
-    if row.get('hash_code'):
-        return str(row['hash_code'])
-    keys = ('name', 'listing_price', 'amount', 'timestamp', 'stat_rolls', 'overall_roll', 'tier')
-    return hashlib.sha256(json.dumps([row.get(k) for k in keys], default=str, sort_keys=True).encode()).hexdigest()[:24]
+def timestamp(value):
+    if value is None:
+        return None
+    if isinstance(value, (int, float)):
+        v = float(value)
+        if v > 1e12: v /= 1000
+        try:
+            return datetime.fromtimestamp(v, timezone.utc)
+        except (ValueError, OverflowError):
+            return None
+    if isinstance(value, str):
+        try:
+            dt = datetime.fromisoformat(value.replace('Z', '+00:00'))
+            return dt.replace(tzinfo=timezone.utc) if dt.tzinfo is None else dt.astimezone(timezone.utc)
+        except ValueError:
+            return None
+    return None
 
 
-def similarity(a, b):
-    aa, bb = a.get('stat_rolls'), b.get('stat_rolls')
+def age_minutes(value, now):
+    dt = timestamp(value)
+    return max(0, round((now - dt).total_seconds() / 60, 1)) if dt else None
+
+
+def comparable(a, b):
+    aa, bb = a.get('stat_rolls') or {}, b.get('stat_rolls') or {}
     if isinstance(aa, dict) and isinstance(bb, dict):
-        common = [abs(number(aa[k]) - number(bb[k])) for k in aa.keys() & bb.keys()
-                  if number(aa[k]) is not None and number(bb[k]) is not None]
-        if len(common) >= 2:
-            return max(.03, math.exp(-statistics.mean(common)/16) * min(1, len(common)/4))
+        shared = set(aa) & set(bb)
+        diffs = [abs(number(aa[k], 999)-number(bb[k], 999)) for k in shared]
+        if len(diffs) >= 2:
+            return max(0.01, math.exp(-statistics.mean(diffs) / 16) * min(1, len(diffs)/4))
     x, y = number(a.get('overall_roll')), number(b.get('overall_roll'))
     if x is not None and y is not None:
-        return max(.05, .5 * math.exp(-abs(x-y)/13))
-    return .25 if not aa and not bb else .1
+        return 0.5 * math.exp(-abs(x-y)/13)
+    return 0.25 if not aa and not bb else 0.05
 
 
-def classify(row, group, history):
-    buy = unit_price(row)
-    if buy is None or buy <= 0:
-        return {'category': 'unpriced', 'warnings': ['Price unavailable']}
-    comps = [(unit_price(p), similarity(row, p)) for p in group if listing_id(p) != listing_id(row)]
-    comps = [(p, w) for p, w in comps if p is not None and p > 0 and w >= .12]
-    if len(comps) < 4:
-        return {'category': 'unrated', 'warnings': ['Not enough comparable listings'], 'comparables': len(comps)}
-    peer_prices = [p for p, _ in comps]
-    med = statistics.median(peer_prices)
-    comps = [(p, w) for p, w in comps if .4 * med <= p <= 2.5 * med]
-    if len(comps) < 4:
-        return {'category': 'unrated', 'warnings': ['Comparables disagree'], 'comparables': len(comps)}
-    comps.sort(key=lambda t: t[0])
-    threshold = sum(w for _, w in comps) * .3
-    total = 0
-    floor = comps[-1][0]
-    for p, w in comps:
-        total += w
-        if total >= threshold:
-            floor = p
-            break
-    all_prices = [unit_price(p) for p in group]
-    all_prices = [p for p in all_prices if p is not None and p > 0]
-    center = statistics.median(all_prices)
-    spread = min(1.5, 1.4826 * statistics.median(abs(p-center) for p in all_prices) / max(1, center))
-    past = [number(h.get('median_ask_e')) for h in history]
-    past = [p for p in past if p is not None and p > 0]
-    anchor = statistics.median(past) if past else None
-    changes = [abs(past[i]/past[i-1]-1) for i in range(1,len(past)) if past[i-1] > 0]
-    volatility = statistics.median(changes) if changes else None
-    base = min(floor, anchor*1.03) if anchor else floor
-    risk = min(.42, .08 + .4*spread + (1.2*min(.15,volatility) if volatility is not None else .08))
-    fair = max(0, math.floor(base*(1-risk)))
-    profit = fair-buy
-    roi = 100*profit/buy
-    confidence = max(.05, min(.95, .18+.035*min(len(comps),12)+.03*min(len(past),8)-.35*spread-(min(.2,volatility) if volatility is not None else .1)))
-    stability = 'unknown' if len(past)<3 else 'volatile' if volatility is not None and volatility>=.12 else 'moderate' if volatility is not None and volatility>=.045 else 'stable'
-    warnings = []
-    if len(past)<3: warnings.append('Limited history')
-    if spread>.35: warnings.append('Wide price spread')
-    if stability=='volatile': warnings.append('High volatility')
-    if len(comps)<7: warnings.append('Few comparable offers')
-    if not row.get('stat_rolls') and row.get('item_type')=='gear': warnings.append('Roll comparison incomplete')
-    score = max(0, profit/LE) * math.sqrt(max(0, roi)/100) * confidence * (1-min(.8,spread)) * (1-min(.8,(volatility or .07)*3))
-    if profit <= 0 or roi < 10:
-        category = 'market'
-    elif stability=='volatile' or spread>.35 or len(past)<3 or confidence<.45:
-        category = 'watch'
-    elif confidence>=.45 and profit >= .5*LE and roi>=25:
-        category = 'candidate'
+def estimate(row, peers, historical):
+    buy = price_e(row)
+    if buy is None: return None
+    prices = [price_e(p) for p in peers if price_e(p) is not None]
+    comps = sorted((price_e(p), comparable(row,p)) for p in peers
+                   if identity(p) != identity(row) and price_e(p) is not None
+                   and comparable(row,p) >= .12)
+    if len(comps) < 4: return None
+    med = statistics.median(v for v,_ in comps)
+    comps = [(v,w) for v,w in comps if med*.4 <= v <= med*2.5]
+    if len(comps) < 4: return None
+    weighted = sorted(comps, key=lambda x:x[0]); total=sum(w for _,w in weighted); running=0
+    floor=weighted[-1][0]
+    for value, weight in weighted:
+        running += weight
+        if running >= total*.30:
+            floor=value;break
+    market_median=statistics.median(prices)
+    dispersion=min(1.5, 1.4826*statistics.median(abs(v-market_median) for v in prices)/max(1,market_median))
+    past=[number(h.get('median_e')) for h in historical if number(h.get('median_e'),0)>0]
+    anchor=statistics.median(past) if past else None
+    movements=[abs(past[i]/past[i-1]-1) for i in range(1,len(past)) if past[i-1]>0]
+    volatility=statistics.median(movements) if movements else None
+    conservative_base=min(floor,anchor*1.03) if anchor else floor
+    haircut=min(.5,.10 + .35*dispersion + (1.2*min(.2,volatility) if volatility is not None else .1))
+    fair=max(0, math.floor(conservative_base*(1-haircut)))
+    profit=fair-buy
+    roi=100*profit/buy
+    conf=max(.05,min(.95,.18+.035*min(12,len(comps))+.03*min(8,len(past))-.35*dispersion-(min(.2,volatility) if volatility is not None else .1)))
+    high_risk=dispersion>.35 or (volatility is not None and volatility >= .12)
+    if profit > 0 and roi >= 25 and conf >= .45 and len(past)>=3 and not high_risk:
+        category='candidate'
+    elif profit > 0 and roi >= 15:
+        category='watch' if high_risk else 'potential'
     else:
-        category = 'potential'
-    return dict(category=category, fair_e=fair, profit_e=round(profit), roi=round(roi,1),
-                score=round(score,3), confidence=round(confidence,3), comparables=len(comps),
-                history_points=len(past), dispersion=round(spread,3),
-                volatility=round(volatility,3) if volatility is not None else None,
-                stability=stability, warnings=warnings)
+        category='unrated'
+    score=max(0,profit)/LE * max(0,roi/100)**.5 * conf * (1-min(.8,dispersion)) * (1-min(.8,(volatility or .07)*3))
+    warnings=[]
+    if len(past)<3: warnings.append('Limited history')
+    if high_risk: warnings.append('Unstable comparable prices')
+    if len(comps)<7: warnings.append('Few comparable listings')
+    return dict(fair_e=fair,profit_e=profit,roi=round(roi,1),confidence=round(conf,3),
+                category=category,score=round(score,3),comparables=len(comps),
+                volatility=round(volatility,4) if volatility is not None else None,
+                stability='volatile' if high_risk else ('unknown' if len(past)<3 else 'stable'),
+                warnings=warnings)
 
 
-def process(listings, history, seen, now):
-    groups = defaultdict(list)
+def build(listings, previous, history, now):
+    old = previous.get('listings', {}) if isinstance(previous,dict) else {}
+    grouped=defaultdict(list)
     for row in listings:
-        if row.get('name') and unit_price(row) is not None:
-            groups[variant(row)].append(row)
-    hist_index = defaultdict(list)
-    cutoff = (datetime.now(timezone.utc)-timedelta(days=14)).isoformat()
-    for h in history:
-        if h.get('at', '') >= cutoff:
-            hist_index[h.get('variant')].append(h)
-    records = []
-    previous = set(seen.get('ids', []))
-    for key, rows in groups.items():
-        past = hist_index[key]
-        for row in rows:
-            price = int_emeralds(row.get('listing_price'))
-            if price is None:
-                continue
-            rid = listing_id(row)
-            assessment = classify(row, rows, past)
-            records.append(dict(id=rid, name=str(row.get('name') or ''), rarity=row.get('rarity'),
-                                item_type=row.get('item_type'), subtype=row.get('subtype'), tier=row.get('tier'),
-                                quantity=row.get('amount') or 1, price_e=price, unit_price_e=unit_price(row),
-                                overall_roll=row.get('overall_roll'), stat_rolls=row.get('stat_rolls') if isinstance(row.get('stat_rolls'),dict) else {},
-                                shiny=bool(row.get('shiny_stat')), timestamp=row.get('timestamp'),
-                                new=bool(seen.get('initialized')) and rid not in previous, **assessment))
-    records.sort(key=lambda v:(v.get('score',0),v.get('profit_e',0)),reverse=True)
-    for key, rows in groups.items():
-        vals = [unit_price(r) for r in rows]
-        vals = [v for v in vals if v is not None and v > 0]
-        if vals:
-            history.append({'at':now,'variant':key,'name':rows[0].get('name'),
-                            'median_ask_e':round(statistics.median(vals)), 'count':len(vals)})
-    cutoff30=(datetime.now(timezone.utc)-timedelta(days=30)).isoformat()
-    history=[h for h in history if h.get('at','')>=cutoff30][-45000:]
-    return records,history
+        if row.get('name') and price_e(row) is not None:
+            grouped[variant(row)].append(row)
+    output=[]; new_seen={}; present=set()
+    for group, rows in grouped.items():
+        group_history=(history.get(group) or [])[-80:]
+        for r in rows:
+            ident=identity(r)
+            if ident in present: continue
+            present.add(ident)
+            first=(old.get(ident) or {}).get('first_seen') or now.isoformat()
+            last=now.isoformat()  # observed in current API response, NOT confirmed in-game
+            listing_age=age_minutes(r.get('timestamp'),now)
+            observation_age=0
+            analysis=estimate(r,rows,group_history)
+            item=dict(id=ident,name=r.get('name'),rarity=r.get('tier') or '',
+                      item_type=r.get('item_type') or '',subtype=r.get('subtype') or '',
+                      quantity=r.get('amount') or 1,price_e=price_e(r),
+                      stat_rolls=r.get('stat_rolls') or {},overall_roll=r.get('overall_roll'),
+                      first_seen=first,last_observed=last,
+                      listing_timestamp=r.get('timestamp'),listing_age_minutes=listing_age,
+                      observed_age_minutes=observation_age,
+                      category='unrated',fair_e=None,profit_e=None,roi=None,score=0,
+                      confidence=None,stability='unknown',warnings=[])
+            if analysis: item.update(analysis)
+            # Without a trustworthy listing timestamp, freshness cannot be asserted.
+            if listing_age is None:
+                item['freshness']='unknown'
+            elif listing_age <= 5:
+                item['freshness']='recent'
+            elif listing_age <= 15:
+                item['freshness']='caution'
+            else:
+                item['freshness']='stale'
+            output.append(item)
+            new_seen[ident]={'first_seen':first,'last_seen':last}
+        values=[price_e(r) for r in rows if price_e(r) is not None]
+        if values:
+            history.setdefault(group,[]).append({'at':now.isoformat(),'median_e':round(statistics.median(values))})
+            history[group]=history[group][-80:]
+    # Previous listings NOT observed this scan are not proven sold; do not publish as active.
+    return output,new_seen,history
+
+
+def extract_listing_page(payload):
+    if isinstance(payload,list):return payload, None
+    if not isinstance(payload,dict):raise ValueError('Unexpected listing response')
+    rows=payload.get('listings') or payload.get('data') or payload.get('results') or []
+    if isinstance(rows,dict):rows=rows.get('listings') or rows.get('items') or []
+    if not isinstance(rows,list):raise ValueError('No listing array found')
+    pagination=payload.get('pagination') or payload.get('meta') or {}
+    pages=pagination.get('total_pages') or payload.get('total_pages') if isinstance(pagination,dict) else payload.get('total_pages')
+    return rows, pages
 
 
 def main():
     key=os.environ.get('WYNNVENTORY_API_KEY','').strip()
-    if not key:
-        raise SystemExit('Missing WYNNVENTORY_API_KEY')
+    if not key:raise RuntimeError('Missing WYNNVENTORY_API_KEY GitHub secret')
+    now=datetime.now(timezone.utc)
+    old=load(DATA/'observed.json', {'listings':{}})
+    history=load(DATA/'history_v4.json',{})
     session=requests.Session()
+    rows=[];total_pages=None
     max_pages=max(1,min(100,int(os.environ.get('MAX_PAGES','20'))))
-    listings=[]
-    complete=False
-    total_pages=None
-    pages=0
+    page_size=200
     for page in range(1,max_pages+1):
-        payload=get(session,'/market/listings',key,{'page':page,'page_size':200,'sort':'timestamp_desc'})
-        batch=payload.get('data')
-        if not isinstance(batch,list):
-            raise RuntimeError('Expected data array from market/listings')
-        listings.extend(r for r in batch if isinstance(r,dict))
-        pages=page
-        pagination=payload.get('pagination') or {}
-        total_pages=pagination.get('total_pages')
-        if (total_pages is not None and page>=int(total_pages)) or len(batch)<200:
-            complete=True
-            break
-        time.sleep(.3)
-    now=datetime.now(timezone.utc).isoformat()
-    history=read(DATA/'history.json',[])
-    # V2 history stored LE; normalize it for V3 so previous scans remain useful.
-    for h in history:
-        if 'median_ask_e' not in h and h.get('median_ask_le') is not None:
-            n=number(h['median_ask_le'])
-            if n is not None: h['median_ask_e']=round(n*LE)
-    seen=read(DATA/'seen.json',{'ids':[],'initialized':False})
-    records,history=process(listings,history,seen,now)
-    pool={"state":"unavailable","items":[],"updated_at":now}
+        payload=get(session,'/market/listings',key,{'page':page,'page_size':page_size,'sort':'timestamp_desc'})
+        items,pages=extract_listing_page(payload)
+        if pages is not None:total_pages=pages
+        rows.extend(items)
+        if not items or len(items)<page_size:break
+        if total_pages is not None and page>=int(total_pages):break
+    if not rows:raise RuntimeError('Scanner returned zero listings; refusing to publish blank data')
+    output,seen,history=build(rows,old,history,now)
+    loot={'state':'unavailable','note':'Lootpool data unavailable'}
     try:
-        raw=get(session,'/lootpools/current/items',key)
-        pool={"state":"available","data":raw.get('data'),"updated_at":now,
-              "note":"Current pool only. Pool membership is not a price forecast."}
-    except requests.RequestException as exc:
-        pool['note']=f'Pool endpoint unavailable ({type(exc).__name__}); check read:lootpool scope.'
-    status=dict(version='3.0',updated_at=now,scanned=len(listings),pages=pages,
-                total_pages=total_pages,complete=complete,
-                candidates=sum(r['category']=='candidate' for r in records),
-                potential=sum(r['category']=='potential' for r in records),
-                watch=sum(r['category']=='watch' for r in records),
-                listings_exported=len(records),
-                note='Asking prices, not confirmed sales. API observations can be stale or incomplete.')
-    # Publish listing identity/rolls but never seller identities, API keys, or raw payloads.
-    write(SITE/'market.json',dict(status=status,listings=records,
-                                  history=history[-5000:],lootpool=pool))
-    write(DATA/'seen.json',dict(ids=[listing_id(r) for r in listings],initialized=True))
-    write(DATA/'history.json',history)
-    write(DATA/'status.json',status)
-    write(DATA/'lootpool.json',pool)
-    print(f"Scan OK V3: {len(listings)} listings, {pages} pages, {status['candidates']} candidates, "
-          f"{status['potential']} potential, {status['watch']} watch, complete={complete}")
+        pool=get(session,'/lootpools/current/items',key)
+        loot={'state':'available','data':pool}
+    except (requests.RequestException,ValueError) as err:
+        loot['note']=f'Lootpool lookup unavailable ({type(err).__name__})'
+    status={'version':'4','updated_at':now.isoformat(),'scanned':len(rows),'exported':len(output),
+            'pages':page,'total_pages':total_pages,
+            'complete':bool((total_pages and page>=int(total_pages)) or len(items)<page_size),
+            'note':'Observed API listings, not confirmed in-game availability; timestamps may be missing.'}
+    save(DATA/'observed.json', {'listings':seen})
+    save(DATA/'history_v4.json',history)
+    save(SITE/'market.json',{'status':status,'listings':output,'lootpool':loot})
+    print('Scan OK V4:',status['scanned'],'observed;',len(output),'exported;',status['complete'],'complete')
 
-if __name__ == '__main__':
-    main()
+
+if __name__ == '__main__':main()
