@@ -1,6 +1,6 @@
+
 {
   "version": 2,
-  "outputDirectory": "site",
   "functions": {
     "api/market.py": {
       "maxDuration": 60
