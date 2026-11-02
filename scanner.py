@@ -117,6 +117,8 @@ def estimate(row, peers, historical):
     comps = sorted((price_e(p), comparable(row,p)) for p in peers
                    if identity(p) != identity(row) and price_e(p) is not None
                    and comparable(row,p) >= .12)
+        if buy is None or not math.isfinite(buy) or buy <= 0:
+        return None
     if len(comps) < 4: return None
     med = statistics.median(v for v,_ in comps)
     comps = [(v,w) for v,w in comps if med*.4 <= v <= med*2.5]
