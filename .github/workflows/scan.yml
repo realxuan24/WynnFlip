@@ -55,3 +55,12 @@ jobs:
             git commit -m "Update WynnFlip market data"
             git push
           fi
+
+          
+      - name: Upload WynnFlip dashboard
+        uses: actions/upload-artifact@v4
+        with:
+          name: wynnflip-dashboard
+          path: site/
+          if-no-files-found: error
+
