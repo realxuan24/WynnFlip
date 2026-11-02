@@ -375,7 +375,7 @@ def build(listings, previous, history, now, profiles=None, reference_rows=None):
             observation_age=0
             profile=profile_quality(r, profiles)
             analysis=estimate(r,rows,group_history,id_weights,id_evidence,profile)
-            item=dict(id=ident,name=r.get('name'),identification_status=identification_status(r),unidentified=(identification_status(r)=='unidentified'),rarity=r.get('tier') or '',
+            item=dict(id=ident,name=r.get('name'),identification_status=identification_status(r),unidentified=(identification_status(r)=='unidentified'),rarity=r.get('rarity') or '',
                       item_type=r.get('item_type') or '',subtype=r.get('subtype') or '',
                       quantity=r.get('amount') or 1,price_e=price_e(r),
                       stat_rolls=roll_numbers(r),exact_ids=exact_ids(r),overall_roll=r.get('overall_roll'),
