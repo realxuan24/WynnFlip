@@ -4,6 +4,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 import requests
+from urllib.parse import quote
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import FileResponse, JSONResponse
 from scanner import build, extract_listing_page, load_profiles, number
@@ -63,6 +64,100 @@ def load_reference(session):
         return []
 
 
+
+def _price_records(payload):
+    """Normalize ranking response shapes without assuming endpoint availability."""
+    if isinstance(payload, list):
+        return payload
+    if not isinstance(payload, dict):
+        return []
+    for key in ('items', 'rankings', 'results', 'data'):
+        value = payload.get(key)
+        if isinstance(value, list):
+            return value
+        if isinstance(value, dict):
+            nested = _price_records(value)
+            if nested:
+                return nested
+    return []
+
+
+def market_price_baselines(session, key):
+    """One optional request for historical item-level market asking-price averages.
+
+    No reliance on this endpoint for scanner availability.  Seven-day market
+    rankings are NOT comparable rolled sales and not verified transactions.
+    """
+    try:
+        response = session.get(
+            API + '/market/rankings',
+            headers={'X-API-Key': key},
+            timeout=5,
+        )
+        response.raise_for_status()
+        rows = _price_records(response.json())
+    except (requests.RequestException, ValueError, TypeError):
+        return {}
+    prices = {}
+    for row in rows:
+        if not isinstance(row, dict) or not row.get('name'):
+            continue
+        # Prefer trimmed mean. It should not be treated as roll-specific price.
+        amount = next((number(row.get(field)) for field in
+             ('average_mid_80_percent_price', 'p50_price', 'average_p50_ema_price')
+             if number(row.get(field)) is not None), None)
+        count = number(row.get('total_count'))
+        if amount is None or amount <= 0 or (count is not None and count < 3):
+            continue
+        # Tier and shiny variants must not be conflated with regular items.
+        if row.get('shiny') or row.get('shiny_stat'):
+            continue
+        prices[(str(row['name']).casefold().strip(), str(row.get('tier') or ''))] = {
+            'price': amount, 'observations': count,
+        }
+    return prices
+
+
+def add_baseline_estimates(items, baselines):
+    """Fill missing roll-comparable valuations with CLEARLY LABELED item baselines.
+
+    Deliberately do not mark these as qualified flips: listing price averages
+    provide neither rolled-item fair value nor actual buyer demand.
+    """
+    filled = 0
+    for item in items:
+        if item.get('fair_e') is not None:
+            item['valuation_source'] = 'roll_comparables'
+            continue
+        if item.get('wynnpool') or item.get('rarity') is None:
+            continue
+        # Skip unidentified/shiny without verifiable matching ranking variants.
+        if item.get('unidentified') or item.get('shiny_stat'):
+            continue
+        name = str(item.get('name') or '').casefold().strip()
+        tier = str(item.get('item_tier') or '')
+        base = baselines.get((name, tier))
+        if base is None and not tier:
+            base = baselines.get((name, ''))
+        if not base:
+            continue
+        price = round(base['price'])
+        buy = number(item.get('price_e'))
+        if price <= 0 or not buy or buy <= 0:
+            continue
+        item['fair_e'] = price
+        item['profit_e'] = price - buy
+        item['roi'] = round(100*(price-buy)/buy,1)
+        item['confidence'] = None   # intentionally not fabricated
+        item['valuation_source'] = 'item_baseline_not_roll_adjusted'
+        item['category'] = 'unrated'
+        item['warnings'] = list(item.get('warnings') or []) + [
+            'Baseline is aggregated item asking prices, NOT a roll-adjusted resale estimate.',
+            'Do not treat its displayed price difference as realizable flip profit.',
+        ]
+        filled += 1
+    return filled
+
 def fetch_market(key, session=None, limit_pages=2, page_size=100):
     session = session or requests.Session()
     rows = []
@@ -86,10 +181,12 @@ def fetch_market(key, session=None, limit_pages=2, page_size=100):
     profiles = load_profiles(ROOT / 'profiles/item_weights.json')
     reference = load_reference(session)
     evaluated, _, _ = build(rows, {"listings": {}}, {}, now, profiles, reference_rows=reference)
+    baselines = market_price_baselines(session, key)
+    baseline_estimates = add_baseline_estimates(evaluated, baselines)
     evaluated.sort(key=lambda x: x.get('listing_age_minutes') if x.get('listing_age_minutes') is not None else 10**9)
     return {
         "status": {
-            "version": "10", "reference_offers": len(reference), "reference_source": "GitHub snapshot of past asking prices (not live or sold)", "updated_at": now.isoformat(),
+            "version": "11", "baseline_items": len(baselines), "baseline_estimates": baseline_estimates, "reference_offers": len(reference), "reference_source": "GitHub snapshot of past asking prices (not live or sold)", "updated_at": now.isoformat(),
             "scanned": len(rows), "exported": len(evaluated),
             "pages": page, "total_pages": total_pages,
             "complete": bool((total_pages and page >= int(total_pages)) or len(listing) < page_size),
