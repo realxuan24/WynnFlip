@@ -1,4 +1,3 @@
-
 name: WynnFlip Market Scan
 
 on:
@@ -19,52 +18,45 @@ jobs:
   scan:
     runs-on: ubuntu-latest
     timeout-minutes: 15
-
     environment:
       name: github-pages
       url: ${{ steps.deployment.outputs.page_url }}
-
     steps:
-      - name: Checkout repository
+      - name: Checkout
         uses: actions/checkout@v4
-
-      - name: Set up Python
+      - name: Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-
       - name: Install dependencies
         run: pip install -r requirements.txt
-
-      - name: Run WynnFlip scanner
+      - name: Test analysis
+        run: python -m unittest discover -s tests -v
+      - name: Scan market
         env:
           WYNNVENTORY_API_KEY: ${{ secrets.WYNNVENTORY_API_KEY }}
+          MAX_PAGES: "20"
         run: python scanner.py
-
-      - name: Verify website files
+      - name: Validate output
         run: |
           test -s site/index.html
           test -s site/market.json
           python -m json.tool site/market.json > /dev/null
-
-      - name: Save market data
+      - name: Save market observations
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add data/ site/market.json
           if ! git diff --cached --quiet; then
-            git commit -m "Update WynnFlip market data"
+            git commit -m "Update WynnFlip market observations"
             git push
           fi
-
-      - name: Configure GitHub Pages
+      - name: Configure Pages
         uses: actions/configure-pages@v5
-
-      - name: Upload website
+      - name: Upload Pages
         uses: actions/upload-pages-artifact@v4
         with:
           path: site/
-
-      - name: Deploy website
-        id: deployment
+      - name: Deploy Pages
         uses: actions/deploy-pages@v4
+        id: deployment
