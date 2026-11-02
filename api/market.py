@@ -268,19 +268,49 @@ redis.call('SET',KEYS[1],cjson.encode(old),'EX',86400*45)
 return cjson.encode({new_count=new_count,repeat_count=repeat_count,tracked=math.min(#ordered,12000)})
 """
 
+def lifecycle_identifier(row):
+    """Use only provider-defined listing IDs, never approximate price/name fingerprints."""
+    for key in ('hash_code', 'listing_id', 'listingId', 'market_listing_id', 'marketListingId'):
+        value=row.get(key)
+        if isinstance(value,(str,int)) and not isinstance(value,bool):
+            result=str(value).strip()
+            if result and len(result)<=180 and not result.startswith('archive:'):
+                return result
+    return None
+
+
 def lifecycle_input(rows):
-    """Stable identifiers only; fabricated IDs must not become turnover evidence."""
+    """Stable provider identifiers only; no fabricated IDs or implied sales."""
     incoming={}
     for row in rows:
-        listing_id=row.get('hash_code')
+        if not isinstance(row,dict): continue
+        listing_id=lifecycle_identifier(row)
         price=price_e(row)
         if not listing_id or not row.get('name') or price is None or price<=0:
             continue
-        listing_id=str(listing_id)
-        if listing_id.startswith('archive:') or len(listing_id)>180:
-            continue
         incoming[listing_id]={'name':str(row['name'])[:100], 'price':price}
     return incoming
+
+
+def fetch_lifecycle_identifiers(session,key,limit_pages=5,page_size=100):
+    """Read legacy feed with documented hash_code when v2 omits stable IDs.
+
+    Independent from the v2 pricing feed: failures never affect normal scanning.
+    """
+    rows=[]
+    try:
+        for page in range(1,limit_pages+1):
+            payload=get_json(session,BASE+'/api/trademarket/listings',key,
+                {'page':page,'page_size':page_size,'sort':'timestamp_desc'},timeout=8)
+            batch,pages=extract_listing_page(payload)
+            if not batch:break
+            rows.extend(batch)
+            if len(batch)<page_size or (pages is not None and page>=int(pages)):break
+        n=len(lifecycle_input(rows))
+        return (rows if n else []),('legacy v1 market listings' if n else 'legacy response had no stable IDs')
+    except (requests.RequestException, ValueError, TypeError, KeyError) as exc:
+        return [],'legacy lookup unavailable: '+type(exc).__name__
+
 
 def update_lifecycle(rows, complete, observed_at):
     incoming=lifecycle_input(rows)
@@ -798,25 +828,30 @@ def fetch_market(key,session=None,limit_pages=5,page_size=100):
     suppress_trivial_leads(items)
     assess_sellability(items,rows,reference+historical_rows)
     mark_observation_freshness(items,now)
+    lifecycle_rows=rows
+    lifecycle_source="v2 market listings"
+    if configured and not lifecycle_input(rows):
+        lifecycle_rows,lifecycle_source=fetch_lifecycle_identifiers(session,key)
     lifecycle_write_error=None
     lifecycle_counts=None
     lifecycle_entries={}
     lifecycle_read_error=None
     lifecycle_metrics={'tracked_items':0,'entries_7d':0,'entries_30d':0,'reobserved':0,'price_changes':0,'price_reductions':0,'persistent':0}
     if configured:
-        lifecycle_counts,lifecycle_write_error,_=update_lifecycle(rows,complete_scan,now.timestamp())
+        lifecycle_counts,lifecycle_write_error,_=update_lifecycle(lifecycle_rows,False,now.timestamp())
         lifecycle_entries,lifecycle_read_error=read_lifecycle()
         if lifecycle_read_error is None:
             lifecycle_metrics=lifecycle_summary(items,lifecycle_entries,now,complete_scan)
     items.sort(key=lambda x:x.get('listing_age_minutes') if x.get('listing_age_minutes') is not None else 1e10)
-    return {'status':{'version':'14.1','updated_at':now.isoformat(),'scanned':len(rows),'exported':len(items),
+    return {'status':{'version':'14.2','updated_at':now.isoformat(),'scanned':len(rows),'exported':len(items),
        'recent_observations':sum(i.get('observation_freshness')=='recent' for i in items),
        'verification_needed':sum(i.get('observation_freshness')=='verify' for i in items),
        'stale_or_unknown':sum(i.get('observation_freshness') in ('stale','unknown') for i in items),
        'newest_observation_age_minutes':min((i['listing_age_minutes'] for i in items if i.get('listing_age_minutes') is not None),default=None),
        'reference_offers':len(reference),
        'lifecycle_tracked_listings':lifecycle_counts.get('tracked') if lifecycle_counts else len(lifecycle_entries),
-       'lifecycle_eligible_scan_ids':len(lifecycle_input(rows)),
+       'lifecycle_eligible_scan_ids':len(lifecycle_input(lifecycle_rows)),
+       'lifecycle_identifier_source':lifecycle_source,
        'lifecycle_new_on_scan':lifecycle_counts.get('new_count') if lifecycle_counts else None,
        'lifecycle_reobserved_on_scan':lifecycle_counts.get('repeat_count') if lifecycle_counts else None,
        'lifecycle_new_7d':lifecycle_metrics['entries_7d'],
@@ -826,7 +861,7 @@ def fetch_market(key,session=None,limit_pages=5,page_size=100):
        'lifecycle_price_reductions':lifecycle_metrics['price_reductions'],
        'lifecycle_persistent':lifecycle_metrics['persistent'],
        'lifecycle_read_status':'ok' if lifecycle_read_error is None and configured else 'unavailable',
-       'lifecycle_complete_scan':complete_scan,
+       'lifecycle_complete_scan':False,
        'lifecycle_write_error':lifecycle_write_error,'lifecycle_read_error':lifecycle_read_error,
        'lifecycle_available':configured and lifecycle_write_error is None and lifecycle_read_error is None,
        'pricing_index_cached_items':len(bases),'pricing_index_read_error':cache_error,'pricing_index_write_error':index_write_error,'durable_history_offers':history_total,'persistent_history':durable,
@@ -851,7 +886,7 @@ def fetch_market(key,session=None,limit_pages=5,page_size=100):
 
 @app.get('/api/health')
 def health():
-    return {'version':'14.1','key_configured':bool(os.getenv('WYNNVENTORY_API_KEY')),
+    return {'version':'14.2','key_configured':bool(os.getenv('WYNNVENTORY_API_KEY')),
             'persistent_history_configured':bool(os.getenv('UPSTASH_REDIS_REST_URL') and os.getenv('UPSTASH_REDIS_REST_TOKEN'))}
 
 @app.get('/api/market')
