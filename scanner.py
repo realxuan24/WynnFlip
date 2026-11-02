@@ -69,9 +69,32 @@ def identity(row):
     return hashlib.sha256(canonical.encode()).hexdigest()[:24]
 
 
+
+def identification_status(row):
+    """An explicit API flag is authoritative; missing rolls alone never imply UNID.
+
+    Returns 'unidentified', 'identified', or 'unknown'. Unknown status is
+    intentionally segregated: guessing here creates fake discounts.
+    """
+    flag = row.get('unidentified')
+    if isinstance(flag, bool):
+        return 'unidentified' if flag else 'identified'
+    if isinstance(flag, (int, float)) and flag in (0, 1):
+        return 'unidentified' if flag == 1 else 'identified'
+    if isinstance(flag, str) and flag.strip().lower() in ('true', 'false', '1', '0'):
+        return 'unidentified' if flag.strip().lower() in ('true', '1') else 'identified'
+    alternative = row.get('identified')
+    if isinstance(alternative, bool):
+        return 'identified' if alternative else 'unidentified'
+    # Valid stats reveal identification even if the flag is absent.
+    if exact_ids(row):
+        return 'identified'
+    return 'unknown'
+
+
 def variant(row):
     return '|'.join(str(row.get(k) or '').lower() for k in
-                    ('name', 'item_type', 'subtype', 'tier', 'unidentified', 'shiny_stat'))
+                    ('name', 'item_type', 'subtype', 'tier', 'shiny_stat')) + '|' + identification_status(row)
 
 
 def timestamp(value):
@@ -352,7 +375,7 @@ def build(listings, previous, history, now, profiles=None, reference_rows=None):
             observation_age=0
             profile=profile_quality(r, profiles)
             analysis=estimate(r,rows,group_history,id_weights,id_evidence,profile)
-            item=dict(id=ident,name=r.get('name'),rarity=r.get('rarity') or (r.get('item') or {}).get('rarity') or '',
+            item=dict(id=ident,name=r.get('name'),identification_status=identification_status(r),unidentified=(identification_status(r)=='unidentified'),rarity=r.get('tier') or '',
                       item_type=r.get('item_type') or '',subtype=r.get('subtype') or '',
                       quantity=r.get('amount') or 1,price_e=price_e(r),
                       stat_rolls=roll_numbers(r),exact_ids=exact_ids(r),overall_roll=r.get('overall_roll'),
