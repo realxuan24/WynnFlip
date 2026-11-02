@@ -137,7 +137,7 @@ def estimate(row, peers, historical):
     haircut=min(.5,.10 + .35*dispersion + (1.2*min(.2,volatility) if volatility is not None else .1))
     fair=max(0, math.floor(conservative_base*(1-haircut)))
     profit=fair-buy
-    roi=100*profit/buy
+    roi = 100 * profit / buy if buy > 0 else None
     conf=max(.05,min(.95,.18+.035*min(12,len(comps))+.03*min(8,len(past))-.35*dispersion-(min(.2,volatility) if volatility is not None else .1)))
     high_risk=dispersion>.35 or (volatility is not None and volatility >= .12)
     if profit > 0 and roi >= 25 and conf >= .45 and len(past)>=3 and not high_risk:
