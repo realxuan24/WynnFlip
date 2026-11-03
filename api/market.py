@@ -1,12 +1,12 @@
 """WynnFlip V13.0: durable market observations and cached item baselines."""
-import os, time, json, statistics, threading
+import os, time, json, statistics, threading, secrets, hmac
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from collections import defaultdict
 from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import quote
 import requests
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Header
 from fastapi.responses import FileResponse, JSONResponse
 from scanner import build, extract_listing_page, load_profiles, number, identification_status, identity
 import scanner as _scanner
@@ -1125,6 +1125,82 @@ def lootpool_fetch(session,key):
     except (requests.RequestException,ValueError,TypeError) as e:
         result['error']='Lootpool feed failed ('+type(e).__name__+')'
     return result
+
+# V16.1: protected, uncached HTTP trigger for cron-job.org.
+# Redis SET NX EX makes overlap prevention work across separate Vercel workers.
+CRON_LOCK_KEY = 'wynnflip:v161:cron:lock'
+CRON_STATUS_KEY = 'wynnflip:v161:cron:last_success'
+CRON_LOCK_SECONDS = 180
+CRON_RELEASE_LUA = "if redis.call('GET',KEYS[1]) == ARGV[1] then return redis.call('DEL',KEYS[1]) else return 0 end"
+
+
+def cron_storage_status():
+    values, error = redis_call([['GET', CRON_STATUS_KEY]])
+    if error:
+        return {'available': False, 'error': 'cloud status unavailable'}
+    try:
+        record = json.loads(values[0]) if values and values[0] else None
+        return {'available': True, 'last_success': record}
+    except (ValueError, TypeError, IndexError):
+        return {'available': False, 'error': 'invalid status record'}
+
+
+@app.get('/api/cron/status')
+def cron_status():
+    # Never expose tokens, scheduler headers, listing IDs or Redis credentials.
+    return JSONResponse(cron_storage_status(), headers={'Cache-Control': 'no-store'})
+
+
+@app.post('/api/cron/scan')
+def cron_scan(x_wynnflip_cron_secret: str | None = Header(default=None)):
+    expected = os.getenv('WYNNFLIP_CRON_SECRET', '').strip()
+    if not expected:
+        return JSONResponse({'error': 'Scheduled scan is not configured'}, status_code=503,
+                            headers={'Cache-Control': 'no-store'})
+    if not x_wynnflip_cron_secret or not hmac.compare_digest(x_wynnflip_cron_secret, expected):
+        return JSONResponse({'error': 'Unauthorized'}, status_code=401,
+                            headers={'Cache-Control': 'no-store'})
+    key = os.getenv('WYNNVENTORY_API_KEY', '').strip()
+    if not key or not (os.getenv('UPSTASH_REDIS_REST_URL') and os.getenv('UPSTASH_REDIS_REST_TOKEN')):
+        return JSONResponse({'error': 'Market API or cloud history storage not configured'}, status_code=503,
+                            headers={'Cache-Control': 'no-store'})
+    nonce = secrets.token_hex(20)
+    acquired, err = redis_call([['SET', CRON_LOCK_KEY, nonce, 'NX', 'EX', CRON_LOCK_SECONDS]])
+    if err:
+        return JSONResponse({'error': 'Cannot acquire Redis scan lock'}, status_code=503,
+                            headers={'Cache-Control': 'no-store'})
+    if not acquired or acquired[0] != 'OK':
+        return JSONResponse({'status': 'already_running'}, status_code=200,
+                            headers={'Cache-Control': 'no-store'})
+    try:
+        # Direct call: bypass the CDN and in-process response cache entirely.
+        data = fetch_market(key)
+        status = data.get('status', {})
+        if (not status.get('persistent_history') or not status.get('lifecycle_available')
+                or status.get('history_write_error') or status.get('lifecycle_write_error')):
+            return JSONResponse({'error': 'History or lifecycle write unverified'}, status_code=503,
+                                headers={'Cache-Control': 'no-store'})
+        record = {'at': status.get('updated_at'),
+                  'listing_count': status.get('scanned'),
+                  'history_count': status.get('durable_history_offers'),
+                  'lifecycle_count': status.get('lifecycle_tracked_listings'),
+                  'seconds': status.get('scan_timings_seconds', {}).get('total')}
+        _, status_err = redis_call([['SET', CRON_STATUS_KEY,
+                                     json.dumps(record, separators=(',', ':'))]])
+        if status_err:
+            return JSONResponse({'error': 'History saved but status record failed'}, status_code=503,
+                                headers={'Cache-Control': 'no-store'})
+        return JSONResponse({'status': 'ok', **record}, headers={'Cache-Control': 'no-store'})
+    except requests.HTTPError:
+        return JSONResponse({'error': 'Upstream market HTTP failure'}, status_code=502,
+                            headers={'Cache-Control': 'no-store'})
+    except (requests.RequestException, ValueError, TypeError, KeyError, IndexError):
+        return JSONResponse({'error': 'Market scan failed'}, status_code=502,
+                            headers={'Cache-Control': 'no-store'})
+    finally:
+        # Ownership-aware release: never unlock another invocation's lease.
+        redis_call([['EVAL', CRON_RELEASE_LUA, 1, CRON_LOCK_KEY, nonce]])
+
 
 @app.get('/api/lootpool')
 def lootpool():
