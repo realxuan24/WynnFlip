@@ -436,29 +436,40 @@ def liquidity_evidence(item):
 # WynnFlip V17 — transparent ID evidence. Never turn asking prices into verified sales.
 # Public weights are optional, and can be absent due to upstream changes.
 WEIGHTS_URL = 'https://raw.githubusercontent.com/szVM3K/builderwynncraft/main/src/item-weights.json'
+WEIGHTS_FALLBACK_URL = 'https://cdn.jsdelivr.net/gh/szVM3K/builderwynncraft@main/src/item-weights.json'
 WEIGHTS_KEY = 'wynnflip:v17:community_weight_profiles'
 
 def normalize_weight_profiles(raw):
-    """Validate source shapes. Never create estimated weights for missing IDs."""
+    """Accept validated community profiles without guessing missing ID weights.
+
+    Supports item -> profile -> signed weights, the common [{name,weights}]
+    profile shape, and direct item -> signed weights. Source keys are normalized
+    only for matching, not silently translated to different identifications.
+    """
     result={}
+    if isinstance(raw,dict) and isinstance(raw.get('items'),dict):raw=raw['items']
     if not isinstance(raw,dict):return result
-    for item, entry in raw.items():
-        profiles={}
-        if isinstance(entry,dict):
-            opts={'Main':entry} if entry and all(isinstance(v,(int,float)) and not isinstance(v,bool) for v in entry.values()) else entry
-        elif isinstance(entry,list):
-            opts={str(x.get('name') or x.get('profile') or 'Main'):x for x in entry if isinstance(x,dict)}
+    for item,entry in raw.items():
+        if isinstance(entry,list):
+            choices={str(x.get('name') or x.get('profile') or 'Main'):x for x in entry if isinstance(x,dict)}
+        elif isinstance(entry,dict):
+            direct=entry.get('weights',entry)
+            choices={'Main':direct} if direct and all(isinstance(v,(int,float)) and not isinstance(v,bool) for v in direct.values()) else entry
         else:continue
-        for label, values in opts.items():
-            if not isinstance(values,dict):continue
-            weights=values.get('weights',values)
+        profiles={}
+        for label,record in choices.items():
+            if not isinstance(record,dict):continue
+            weights=record.get('weights',record)
             if not isinstance(weights,dict):continue
-            normalized={}
-            for k,v in weights.items():
-                if not isinstance(v,(int,float)) or isinstance(v,bool) or not math.isfinite(v) or not 0<abs(v)<=1:normalized={};break
-                normalized[normalized_name(k)]=float(v)
-            if normalized and .90<=sum(abs(x) for x in normalized.values())<=1.10:
-                profiles[str(label)]=normalized
+            cleaned={}
+            for key,weight in weights.items():
+                if not isinstance(weight,(int,float)) or isinstance(weight,bool) or not math.isfinite(weight) or not 0<abs(weight)<=1:
+                    cleaned={};break
+                clean_key=normalized_name(key)
+                if not clean_key or clean_key in cleaned:cleaned={};break
+                cleaned[clean_key]=float(weight)
+            if cleaned and .90<=sum(abs(x) for x in cleaned.values())<=1.10:
+                profiles[str(label)]=cleaned
         if profiles:result[normalized_name(item)]=profiles
     return result
 
@@ -472,15 +483,18 @@ def _community_profiles_uncached(session):
             payload=json.loads(cached_weights[0]); profiles=normalize_weight_profiles(payload)
             if len(profiles)>=10:return profiles,'Redis community profiles',None
         except (TypeError,ValueError):pass
-    try:
-        response=get_json(session,WEIGHTS_URL,timeout=4)
-        profiles=normalize_weight_profiles(response)
-        if len(profiles)>=10:
-            if not error:redis_call([['SET',WEIGHTS_KEY,json.dumps(response,separators=(',',':')),'EX',86400*7]])
-            return profiles,'public community weights',None
-        return local,'unavailable','community-weight schema unrecognized'
-    except (requests.RequestException,ValueError,TypeError) as exc:
-        return local,'unavailable',type(exc).__name__
+    errors=[]
+    for url in (WEIGHTS_URL,WEIGHTS_FALLBACK_URL):
+        try:
+            response=get_json(session,url,timeout=4)
+            profiles=normalize_weight_profiles(response)
+            if len(profiles)>=10:
+                if not error:redis_call([['SET',WEIGHTS_KEY,json.dumps(response,separators=(',',':')),'EX',86400*7]])
+                return profiles,'Wynnpool-derived community profiles',None
+            errors.append('unrecognized community profile format')
+        except (requests.RequestException,ValueError,TypeError) as exc:
+            errors.append(type(exc).__name__)
+    return local,'unavailable','; '.join(errors)
 
 def community_profiles(session):
     return cached('v17:community_profiles',1800,lambda:_community_profiles_uncached(session))
@@ -494,6 +508,8 @@ def v17_roll_evidence(items, live_rows, history_rows, profiles):
     groups=defaultdict(dict)
     for row in live_rows+history_rows:
         if not isinstance(row,dict):continue
+        observed=normalized_observation_time(row.get('timestamp'))
+        if observed is None or observed>time.time()+300 or time.time()-observed>14*86400:continue
         name=normalized_name(row.get('name'))
         p=price_e(row)
         if not name or not p or row.get('shiny_stat'):continue
@@ -547,10 +563,10 @@ def v17_roll_evidence(items, live_rows, history_rows, profiles):
                 mode='unweighted roll similarity'
             if distance<=cutoff:candidates.append(price)
         if candidates:
-            result['status']='matched_asking_evidence' if len(candidates)>=3 else 'thin_matching_evidence'
+            result['status']='matched_asking_evidence' if len(candidates)>=5 and max(candidates)/max(1,min(candidates))<=2 else 'thin_matching_evidence'
             result['method']=mode
             result['matched_offer_count']=len(candidates)
-            if len(candidates)>=3:
+            if len(candidates)>=5 and max(candidates)/max(1,min(candidates))<=2:
                 ordered=sorted(candidates)
                 result['matched_asking_range_e']={'low':ordered[max(0,int((len(ordered)-1)*.25))],
                          'median':round(statistics.median(ordered)),
@@ -923,31 +939,87 @@ def apply_trade_costs(items):
 
 
 
-def add_tentative_price_ranges(items, historical_rows):
-    """Expose tentative same-status asking ranges, never implied resale profits."""
-    count = 0
-    for item in items:
-        item['tentative_range_e'] = None
-        item['tentative_sample_count'] = 0
-        if item.get('resale_estimate_e') is not None:
-            continue
-        offers = status_matched_offers(item, historical_rows)
-        if not offers:
-            continue
-        prices = sorted(offers.values())
-        # For two+ independent offers exclude egregious outliers where possible.
-        if len(prices) >= 3:
-            median = statistics.median(prices)
-            trimmed = [p for p in prices if 0.4 * median <= p <= 2.5 * median]
-            if len(trimmed) >= 2:
-                prices = trimmed
-        item['tentative_range_e'] = {'low': prices[0], 'high': prices[-1]}
-        item['tentative_sample_count'] = len(prices)
-        item['tentative_range_kind'] = ('UNID-only historical asking prices' if item.get('identification_status') == 'unidentified'
-                                        else 'Same-item identified asks; rolls not adjusted')
-        count += 1
-    return count
+def verified_comparable_rows(item, rows, *, max_age_days=14):
+    """Recent listing observations only; old archived or malformed rows cannot
+    be used to justify a prominent market reference. ID keys deduplicate offers.
+    A missing timestamp or id is treated as missing evidence, not a market price.
+    """
+    target=item.get('identification_status')
+    if target not in ('identified','unidentified'):return []
+    target_name=normalized_name(item.get('name'))
+    if not target_name:return []
+    now=time.time()
+    results={}
+    def norm(x):return str(x or '').strip().casefold()
+    for row in rows:
+        if not isinstance(row,dict) or normalized_name(row.get('name'))!=target_name:continue
+        if identification_status(row)!=target:continue
+        if norm(row.get('shiny_stat'))!=norm(item.get('shiny_stat')):continue
+        if norm(row.get('item_type'))!=norm(item.get('item_type')):continue
+        if norm(row.get('subtype'))!=norm(item.get('subtype')):continue
+        other_tier=norm(row.get('rarity') or row.get('tier'))
+        own_tier=norm(item.get('rarity') or item.get('item_tier'))
+        if other_tier and own_tier and other_tier!=own_tier:continue
+        # Reject old rows (including archived rows with uncertain observation times).
+        observed=normalized_observation_time(row.get('timestamp'))
+        if observed is None or observed>now+300 or now-observed>max_age_days*86400:continue
+        unique=identity(row)
+        if not unique or str(unique)==str(item.get('id') or ''):continue
+        price=price_e(row)
+        if not price or price>1e12:continue
+        old=results.get(unique)
+        if old is None or observed>old[0]:results[unique]=(observed,price, row)
+    return [(uid,*record) for uid,record in results.items()]
 
+
+def add_tentative_price_ranges(items, historical_rows):
+    """Only disclose cautious, auditable SAME-STATUS ASKING benchmarks.
+
+    No estimate when evidence is thin, stale or internally contradictory.
+    The price model never extrapolates or manufactures a 'realistic' price.
+    """
+    count=0
+    for item in items:
+        item['tentative_range_e']=None
+        item['tentative_sample_count']=0
+        item['tentative_status']='insufficient_evidence'
+        item['tentative_reason']='Fewer than 5 independent recent comparable offers'
+        item['tentative_comparables']=[]
+        if item.get('resale_estimate_e') is not None:continue
+        matches=verified_comparable_rows(item,historical_rows)
+        if len(matches)<5:continue
+        prices=sorted(record[2] for record in matches)
+        median=statistics.median(prices)
+        buy=number(item.get('price_e'))
+        # An extraordinary gap, such as the reported Temerity 84x reference,
+        # needs independent verification before a price is put on the main card.
+        # This is a presentation safety gate, never an estimate/cap on true value.
+        if buy and median / buy > 8:
+            item['tentative_reason']='Extraordinary gap (>8x listing price): requires direct market verification'
+            continue
+        # Historical price scale disagreement is itself uncertainty; do not
+        # arbitrarily stretch/cap observations into an attractive estimate.
+        inliers=[record for record in matches if .65*median<=record[2]<=1.6*median]
+        if len(inliers)<5:
+            item['tentative_reason']='Recent offers disagree too much to estimate a range'
+            continue
+        ordered=sorted(x[2] for x in inliers)
+        lo=ordered[(len(ordered)-1)//4]
+        hi=ordered[(3*(len(ordered)-1))//4]
+        if lo<=0 or hi/lo>1.7:
+            item['tentative_reason']='Comparable prices are too inconsistent'
+            continue
+        # NEVER call this a verified resale value: these are asking prices.
+        item['tentative_range_e']={'low':lo,'high':hi,'median':round(statistics.median(ordered))}
+        item['tentative_sample_count']=len(inliers)
+        item['tentative_status']='recent_consistent_asking_evidence'
+        item['tentative_reason']='Recent, independent asking-price references; not matched sales'
+        item['tentative_range_kind']=('Recent UNID asking references' if item.get('identification_status')=='unidentified'
+                                       else 'Recent identified asking references; not roll-adjusted')
+        item['tentative_comparables']=[{'id':str(u)[:100],'price_e':p,'observed_at':datetime.fromtimestamp(t,timezone.utc).isoformat()}
+                                      for u,t,p,_ in sorted(inliers,key=lambda x:x[2])[:12]]
+        count+=1
+    return count
 
 def normalized_observation_time(value):
     """Normalize API observation timestamps; do not assert in-game creation time."""
@@ -1096,7 +1168,7 @@ def fetch_market(key,session=None,limit_pages=5,page_size=100):
         item['v161_liquidity']=liquidity_evidence(item)
     items.sort(key=lambda x:x.get('listing_age_minutes') if x.get('listing_age_minutes') is not None else 1e10)
     timings['total']=round(time.perf_counter()-started,2)
-    return {'status':{'version':'17.0','scan_timings_seconds':timings,'updated_at':now.isoformat(),'scanned':len(rows),'exported':len(items),
+    return {'status':{'version':'17.1','scan_timings_seconds':timings,'updated_at':now.isoformat(),'scanned':len(rows),'exported':len(items),
        'recent_observations':sum(i.get('observation_freshness')=='recent' for i in items),
        'verification_needed':sum(i.get('observation_freshness')=='verify' for i in items),
        'stale_or_unknown':sum(i.get('observation_freshness') in ('stale','unknown') for i in items),
@@ -1237,7 +1309,7 @@ def pool_names(payload):
 def lootpool_fetch(session,key):
     now=datetime.now(timezone.utc)
     week=now.isocalendar()
-    result={'version':'17.0','iso_year':week.year,'iso_week':week.week,'updated_at':now.isoformat(),
+    result={'version':'17.1','iso_year':week.year,'iso_week':week.week,'updated_at':now.isoformat(),
             'available':False,'items':[],'added':[],'removed':[],
             'source':'WynnVentory weekly lootpool','error':None,'historical_comparison':'unavailable',
             'warning':'Lootpool presence indicates potential incoming supply, not sales or future prices.'}
