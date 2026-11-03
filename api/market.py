@@ -10,6 +10,7 @@ from fastapi import FastAPI, HTTPException, Header
 from fastapi.responses import FileResponse, JSONResponse
 from scanner import build, extract_listing_page, load_profiles, number, identification_status, identity, exact_ids, normalized_name, profile_quality, roll_numbers
 import scanner as _scanner
+from qualification import qualify_items
 
 def price_e(row):
     """WynnVentory listing_price is a per-item ask, not a stack total.
@@ -1166,9 +1167,10 @@ def fetch_market(key,session=None,limit_pages=5,page_size=100):
         item['v16_trend']=trends.get(str(item.get('name') or '').strip().casefold(), {'asking_price_trend':'insufficient'})
         item['v16_scenarios']=conservative_scenarios(item)
         item['v161_liquidity']=liquidity_evidence(item)
+    qualified_flips = qualify_items(items)
     items.sort(key=lambda x:x.get('listing_age_minutes') if x.get('listing_age_minutes') is not None else 1e10)
     timings['total']=round(time.perf_counter()-started,2)
-    return {'status':{'version':'17.1','scan_timings_seconds':timings,'updated_at':now.isoformat(),'scanned':len(rows),'exported':len(items),
+    return {'status':{'version':'17.2','scan_timings_seconds':timings,'updated_at':now.isoformat(),'scanned':len(rows),'exported':len(items),
        'recent_observations':sum(i.get('observation_freshness')=='recent' for i in items),
        'verification_needed':sum(i.get('observation_freshness')=='verify' for i in items),
        'stale_or_unknown':sum(i.get('observation_freshness') in ('stale','unknown') for i in items),
@@ -1201,6 +1203,7 @@ def fetch_market(key,session=None,limit_pages=5,page_size=100):
        'no_price_evidence':sum(x.get('fair_e') is None and not x.get('tentative_range_e') for x in items),
        'low_value_suppressed':sum(bool(i.get('low_value_filtered')) for i in items),
        'roll_opportunities':sum(i.get('v12_signal')=='roll_opportunity' for i in items),
+       'v172_qualified_flips':qualified_flips,
        'research_priority':sum(i.get('v13_recommendation')=='research_priority' and not i.get('low_value_filtered') for i in items),
        'speculative_leads':sum(i.get('v13_recommendation')=='speculative' and not i.get('low_value_filtered') for i in items),
        'research_candidates':sum(i.get('v12_signal')=='research' for i in items),
