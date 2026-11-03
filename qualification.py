@@ -97,8 +97,8 @@ def qualify_item(item):
     promising_reasons = []
     if item.get("low_value_filtered"):
         promising_reasons.append("Low-value/bulk item")
-    if age is None or not math.isfinite(age) or age < 0 or age > 15:
-        promising_reasons.append("Observation older than 15 minutes or unverifiable")
+    if age is None or not math.isfinite(age) or age < 0 or age > 5:
+        promising_reasons.append("Observation older than five minutes or unverifiable")
     if source not in ("roll_comparables", "unid_comparables") or buy is None:
         promising_reasons.append("No comparable-based valuation")
     if comparable_count < 3:
@@ -134,6 +134,10 @@ def qualify_item(item):
         promising_net, promising_roi = None, None
     if promising_net is None or promising_net < 4 * LE or promising_roi is None or promising_roi < 20:
         promising_reasons.append("Conservative profit below 4 LE or ROI below 20%")
+    scenario = item.get("v16_scenarios") or {}
+    if scenario.get("supported") and (scenario.get("net_profit_low_e") is None or
+                                      float(scenario["net_profit_low_e"]) <= 0):
+        promising_reasons.append("Cautious pricing scenario does not show positive net profit")
 
     tier = "high_confidence" if not reasons else ("promising" if not promising_reasons else "research")
     displayed_reference = caution_reference if tier == "high_confidence" else promising_reference if tier == "promising" else None
