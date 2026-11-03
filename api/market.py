@@ -10,6 +10,7 @@ from fastapi import FastAPI, HTTPException, Header
 from fastapi.responses import FileResponse, JSONResponse
 from scanner import build, extract_listing_page, load_profiles, number, identification_status, identity, exact_ids, normalized_name, profile_quality, roll_numbers
 import scanner as _scanner
+import lifecycle_shards as _lifecycle_shards
 from qualification import qualify_items
 
 def price_e(row):
@@ -328,25 +329,17 @@ def fetch_lifecycle_identifiers(session,key,limit_pages=5,page_size=100):
 
 
 def update_lifecycle(rows, complete, observed_at):
-    incoming=lifecycle_input(rows)
-    if not incoming:
-        return None,'no stable identifiers',{}
-    result,err=redis_call([['EVAL', LIFECYCLE_LUA,1,LIFECYCLE_KEY,
-                            str(int(observed_at)),json.dumps(incoming,separators=(',',':')),
-                            '1' if complete else '0']])
-    if err:return None,err,{}
-    try:
-        counts=json.loads(result[0]);return counts,None,incoming
-    except (TypeError,ValueError,IndexError):return None,'invalid lifecycle update',{}
+    """Record provider listing IDs in bounded Redis shards.
+
+    The incomplete feed never proves absence, so `complete` does not
+    increment missing counts. Existing V14 storage remains read-only.
+    """
+    return _lifecycle_shards.update(rows, observed_at, redis_call, lifecycle_input)
+
 
 def read_lifecycle():
-    result,error=redis_call([['GET',LIFECYCLE_KEY]])
-    if error:return {},error
-    try:
-        value=json.loads(result[0]) if result and result[0] else {}
-        entries=value.get('entries',{}) if isinstance(value,dict) else {}
-        return entries if isinstance(entries,dict) else {},None
-    except (TypeError,ValueError):return {},'invalid lifecycle JSON'
+    """Read shards and legacy observations without mutating old Redis history."""
+    return _lifecycle_shards.read(redis_call)
 
 def lifecycle_summary(items,entries,now,complete):
     """7/30d listing entry and observed persistence; never call removals sales."""
@@ -1152,6 +1145,10 @@ def fetch_market(key,session=None,limit_pages=5,page_size=100):
             lifecycle_counts,lifecycle_write_error,lifecycle_entries,lifecycle_read_error=lifecycle_future.result()
         if lifecycle_read_error is None:
             lifecycle_metrics=lifecycle_summary(items,lifecycle_entries,now,complete_scan)
+            # Sharded writer returns only touched-shard counts; the merged read
+            # includes all shards plus existing legacy entries.
+            if lifecycle_counts is not None:
+                lifecycle_counts['tracked']=len(lifecycle_entries)
     timings['history_and_lifecycle']=round(time.perf_counter()-history_start,2)
     # Enabled means Redis acknowledged the write, not just that keys exist.
     durable=configured and saved_count is not None and history_read_error is None
