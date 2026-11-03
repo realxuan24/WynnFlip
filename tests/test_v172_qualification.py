@@ -75,7 +75,7 @@ def test_qualification_count():
 def test_three_similar_roll_offers_are_promising():
     x = candidate()
     x["comparables"] = 3
-    x["listing_age_minutes"] = 9
+    x["listing_age_minutes"] = 3
     x["v17_roll_intel"].update(status="thin_matching_evidence", matched_offer_count=3)
     q = qualify_item(x)["v172_qualification"]
     assert q["tier"] == "promising"
@@ -100,3 +100,25 @@ def test_three_level_classification():
     assert [x["v172_qualification"]["tier"] for x in (high, promising, research)] == [
         "high_confidence", "promising", "research",
     ]
+
+def test_stale_unid_shattershard_not_promising():
+    x = candidate()
+    x.update(name="Shattershard", identification_status="unidentified",
+             valuation_source="unid_comparables", comparables=4,
+             listing_age_minutes=12, purchase_total_e=275251,
+             resale_estimate_e=370800)
+    assert qualify_item(x)["v172_qualification"]["tier"] == "research"
+
+def test_negative_cautious_scenario_blocks_promising():
+    x = candidate()
+    x.update(identification_status="unidentified",
+             valuation_source="unid_comparables", comparables=4)
+    x["v16_scenarios"]={"supported":True,"net_profit_low_e":-10394}
+    assert qualify_item(x)["v172_qualification"]["tier"] == "research"
+
+def test_positive_cautious_scenario_can_be_promising():
+    x = candidate()
+    x.update(identification_status="unidentified",
+             valuation_source="unid_comparables", comparables=4)
+    x["v16_scenarios"]={"supported":True,"net_profit_low_e":5000}
+    assert qualify_item(x)["v172_qualification"]["tier"] == "promising"
