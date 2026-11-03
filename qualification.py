@@ -135,9 +135,10 @@ def qualify_item(item):
     if promising_net is None or promising_net < 4 * LE or promising_roi is None or promising_roi < 20:
         promising_reasons.append("Conservative profit below 4 LE or ROI below 20%")
     scenario = item.get("v16_scenarios") or {}
-    if scenario.get("supported") and (scenario.get("net_profit_low_e") is None or
-                                      float(scenario["net_profit_low_e"]) <= 0):
+    downside = _positive(scenario.get("net_profit_low_e"))
+    if scenario.get("supported") and downside is None:
         promising_reasons.append("Cautious pricing scenario does not show positive net profit")
+        reasons.append("Cautious pricing scenario does not show positive net profit")
 
     tier = "high_confidence" if not reasons else ("promising" if not promising_reasons else "research")
     displayed_reference = caution_reference if tier == "high_confidence" else promising_reference if tier == "promising" else None
