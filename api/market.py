@@ -1204,6 +1204,8 @@ def fetch_market(key,session=None,limit_pages=5,page_size=100):
        'low_value_suppressed':sum(bool(i.get('low_value_filtered')) for i in items),
        'roll_opportunities':sum(i.get('v12_signal')=='roll_opportunity' for i in items),
        'v172_qualified_flips':qualified_flips,
+       'v172_promising_flips':sum(i.get('v172_qualification',{}).get('tier')=='promising' for i in items),
+       'v172_research_leads':sum(i.get('v172_qualification',{}).get('tier')=='research' and i.get('v12_signal') in ('research','roll_opportunity') and not i.get('low_value_filtered') for i in items),
        'research_priority':sum(i.get('v13_recommendation')=='research_priority' and not i.get('low_value_filtered') for i in items),
        'speculative_leads':sum(i.get('v13_recommendation')=='speculative' and not i.get('low_value_filtered') for i in items),
        'research_candidates':sum(i.get('v12_signal')=='research' for i in items),
