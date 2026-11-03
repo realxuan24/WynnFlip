@@ -567,7 +567,7 @@ def v17_roll_evidence(items, live_rows, history_rows, profiles):
             result['status']='matched_asking_evidence' if len(candidates)>=5 and max(candidates)/max(1,min(candidates))<=2 else 'thin_matching_evidence'
             result['method']=mode
             result['matched_offer_count']=len(candidates)
-            if len(candidates)>=5 and max(candidates)/max(1,min(candidates))<=2:
+            if len(candidates)>=3 and max(candidates)/max(1,min(candidates))<=2:
                 ordered=sorted(candidates)
                 result['matched_asking_range_e']={'low':ordered[max(0,int((len(ordered)-1)*.25))],
                          'median':round(statistics.median(ordered)),
@@ -1204,6 +1204,8 @@ def fetch_market(key,session=None,limit_pages=5,page_size=100):
        'low_value_suppressed':sum(bool(i.get('low_value_filtered')) for i in items),
        'roll_opportunities':sum(i.get('v12_signal')=='roll_opportunity' for i in items),
        'v172_qualified_flips':qualified_flips,
+       'v172_promising_flips':sum(i.get('v172_qualification',{}).get('tier')=='promising' for i in items),
+       'v172_research_leads':sum(i.get('v172_qualification',{}).get('tier')=='research' and i.get('v12_signal') in ('research','roll_opportunity') and not i.get('low_value_filtered') for i in items),
        'research_priority':sum(i.get('v13_recommendation')=='research_priority' and not i.get('low_value_filtered') for i in items),
        'speculative_leads':sum(i.get('v13_recommendation')=='speculative' and not i.get('low_value_filtered') for i in items),
        'research_candidates':sum(i.get('v12_signal')=='research' for i in items),

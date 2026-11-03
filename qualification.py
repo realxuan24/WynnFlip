@@ -92,14 +92,62 @@ def qualify_item(item):
     reject(net is None or net < MIN_NET_PROFIT_E, "Conservative spread below 8 LE")
     reject(roi is None or roi < MIN_ROI_PCT, "Conservative return below 25%")
 
+    # V17.2 unified board: "promising" is a lower-evidence RESEARCH lead,
+    # not a weakening of the qualified/high-confidence requirements.
+    promising_reasons = []
+    if item.get("low_value_filtered"):
+        promising_reasons.append("Low-value/bulk item")
+    if age is None or not math.isfinite(age) or age < 0 or age > 15:
+        promising_reasons.append("Observation older than 15 minutes or unverifiable")
+    if source not in ("roll_comparables", "unid_comparables") or buy is None:
+        promising_reasons.append("No comparable-based valuation")
+    if comparable_count < 3:
+        promising_reasons.append("Fewer than three comparable offers")
+    if sellability.get("label") in ("Unknown / thin market", "High resale risk") or risk == "Higher resale risk":
+        promising_reasons.append("Insufficient market activity or elevated risk")
+    if int(_positive(sellability.get("cheaper_asks")) or 0) > 2:
+        promising_reasons.append("Too many cheaper competing asks")
+
+    promising_reference = reference
+    if source == "roll_comparables":
+        intel = item.get("v17_roll_intel") or {}
+        matched = intel.get("matched_asking_range_e") or {}
+        low = _positive(matched.get("low"))
+        if int(_positive(intel.get("matched_offer_count")) or 0) < 3 or low is None:
+            promising_reasons.append("Fewer than three similar-roll offers")
+        if reference and low:
+            promising_reference = min(reference, low)
+            if reference > low * 2:
+                promising_reasons.append("Model resale ask differs too much from roll-matched market")
+    elif source == "unid_comparables":
+        if item.get("identification_status") != "unidentified":
+            promising_reasons.append("UNID status mismatch")
+        if reference and buy and reference * qty / buy > 4:
+            promising_reasons.append("Extreme UNID price gap")
+
+    if buy and promising_reference:
+        buyer_inclusive = item.get("price_assumption") == "buyer_inclusive"
+        promising_take_home = round(promising_reference * qty / 1.05) if buyer_inclusive else round(promising_reference * qty)
+        promising_net = promising_take_home - buy
+        promising_roi = 100.0 * promising_net / buy
+    else:
+        promising_net, promising_roi = None, None
+    if promising_net is None or promising_net < 4 * LE or promising_roi is None or promising_roi < 20:
+        promising_reasons.append("Conservative profit below 4 LE or ROI below 20%")
+
+    tier = "high_confidence" if not reasons else ("promising" if not promising_reasons else "research")
+    displayed_reference = caution_reference if tier == "high_confidence" else promising_reference if tier == "promising" else None
+    displayed_net = net if tier == "high_confidence" else promising_net if tier == "promising" else None
+    displayed_roi = roi if tier == "high_confidence" else promising_roi if tier == "promising" else None
     item["v172_qualification"] = {
-        "status": "qualified" if not reasons else "research_only",
-        "reasons": reasons,
+        "status": "qualified" if tier == "high_confidence" else "promising" if tier == "promising" else "research_only",
+        "tier": tier,
+        "reasons": reasons if tier == "research" else [] if tier == "high_confidence" else promising_reasons,
         "comparable_count": comparable_count,
-        "conservative_reference_e": round(caution_reference) if caution_reference else None,
-        "conservative_net_profit_e": round(net) if net is not None else None,
-        "conservative_roi_pct": round(roi, 1) if roi is not None else None,
-        "note": "Evidence-screened opportunity, not a verified sale, guaranteed profit, or confirmed availability.",
+        "conservative_reference_e": round(displayed_reference) if displayed_reference else None,
+        "conservative_net_profit_e": round(displayed_net) if displayed_net is not None else None,
+        "conservative_roi_pct": round(displayed_roi, 1) if displayed_roi is not None else None,
+        "note": "Observed asking-price comparison, not a confirmed sale, guaranteed profit, or confirmed availability.",
     }
     return item
 
