@@ -51,7 +51,7 @@ def test_insufficient_evidence_never_qualifies():
 
 def test_minimum_net_profit_and_roi():
     x = candidate()
-    x["purchase_total_e"] = 97000
+    x["purchase_total_e"] = 82000
     assert qualify_item(x)["v172_qualification"]["status"] == "research_only"
     x = candidate()
     x["resale_estimate_e"] = 55000
