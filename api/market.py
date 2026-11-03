@@ -1145,6 +1145,10 @@ def fetch_market(key,session=None,limit_pages=5,page_size=100):
             lifecycle_counts,lifecycle_write_error,lifecycle_entries,lifecycle_read_error=lifecycle_future.result()
         if lifecycle_read_error is None:
             lifecycle_metrics=lifecycle_summary(items,lifecycle_entries,now,complete_scan)
+            # Sharded writer returns only touched-shard counts; the merged read
+            # includes all shards plus existing legacy entries.
+            if lifecycle_counts is not None:
+                lifecycle_counts['tracked']=len(lifecycle_entries)
     timings['history_and_lifecycle']=round(time.perf_counter()-history_start,2)
     # Enabled means Redis acknowledged the write, not just that keys exist.
     durable=configured and saved_count is not None and history_read_error is None
