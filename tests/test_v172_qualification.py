@@ -34,7 +34,7 @@ def test_baseline_only_never_qualifies():
 def test_unweighted_rolls_never_qualify():
     x = candidate()
     x["v17_roll_intel"]["method"] = "unweighted roll similarity"
-    assert qualify_item(x)["v172_qualification"]["status"] == "research_only"
+    assert qualify_item(x)["v172_qualification"]["status"] == "promising"
 
 def test_risky_or_stale_listings_never_qualify():
     x = candidate()
@@ -52,7 +52,7 @@ def test_insufficient_evidence_never_qualifies():
 def test_minimum_net_profit_and_roi():
     x = candidate()
     x["purchase_total_e"] = 82000
-    assert qualify_item(x)["v172_qualification"]["status"] == "research_only"
+    assert qualify_item(x)["v172_qualification"]["status"] == "promising"
     x = candidate()
     x["resale_estimate_e"] = 55000
     assert qualify_item(x)["v172_qualification"]["status"] == "research_only"
@@ -71,3 +71,32 @@ def test_qualification_count():
     weak = deepcopy(strong)
     weak["listing_age_minutes"] = 70
     assert qualify_items([strong, weak]) == 1
+
+def test_three_similar_roll_offers_are_promising():
+    x = candidate()
+    x["comparables"] = 3
+    x["listing_age_minutes"] = 9
+    x["v17_roll_intel"].update(status="thin_matching_evidence", matched_offer_count=3)
+    q = qualify_item(x)["v172_qualification"]
+    assert q["tier"] == "promising"
+    assert q["conservative_reference_e"] == 110000
+
+def test_unmatched_rolls_remain_research_only():
+    x = candidate()
+    x["v17_roll_intel"].update(
+        status="insufficient_roll_evidence", matched_offer_count=0,
+        matched_asking_range_e=None,
+    )
+    assert qualify_item(x)["v172_qualification"]["tier"] == "research"
+
+def test_three_level_classification():
+    high = candidate()
+    promising = candidate()
+    promising["comparables"] = 3
+    promising["v17_roll_intel"].update(status="thin_matching_evidence", matched_offer_count=3)
+    research = candidate()
+    research["valuation_source"] = "item_baseline_not_roll_adjusted"
+    qualify_items([high, promising, research])
+    assert [x["v172_qualification"]["tier"] for x in (high, promising, research)] == [
+        "high_confidence", "promising", "research",
+    ]
