@@ -567,7 +567,7 @@ def v17_roll_evidence(items, live_rows, history_rows, profiles):
             result['status']='matched_asking_evidence' if len(candidates)>=5 and max(candidates)/max(1,min(candidates))<=2 else 'thin_matching_evidence'
             result['method']=mode
             result['matched_offer_count']=len(candidates)
-            if len(candidates)>=5 and max(candidates)/max(1,min(candidates))<=2:
+            if len(candidates)>=3 and max(candidates)/max(1,min(candidates))<=2:
                 ordered=sorted(candidates)
                 result['matched_asking_range_e']={'low':ordered[max(0,int((len(ordered)-1)*.25))],
                          'median':round(statistics.median(ordered)),
