@@ -1,5 +1,5 @@
 """WynnFlip V13.0: durable market observations and cached item baselines."""
-import os, time, json, statistics, threading, secrets, hmac
+import os, time, json, statistics, threading, secrets, hmac, math
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from collections import defaultdict
 from datetime import datetime, timezone
@@ -8,7 +8,7 @@ from urllib.parse import quote
 import requests
 from fastapi import FastAPI, HTTPException, Header
 from fastapi.responses import FileResponse, JSONResponse
-from scanner import build, extract_listing_page, load_profiles, number, identification_status, identity
+from scanner import build, extract_listing_page, load_profiles, number, identification_status, identity, exact_ids, normalized_name, profile_quality, roll_numbers
 import scanner as _scanner
 
 def price_e(row):
@@ -432,6 +432,152 @@ def liquidity_evidence(item):
             'possible_removals':None,'confirmed_sales':None,'estimated_sale_hours':None,
             'note':'Name-wide supply-side indicators, not buyer demand; incomplete scans cannot prove removals or sales.'}
 
+
+# WynnFlip V17 — transparent ID evidence. Never turn asking prices into verified sales.
+# Public weights are optional, and can be absent due to upstream changes.
+WEIGHTS_URL = 'https://raw.githubusercontent.com/szVM3K/builderwynncraft/main/src/item-weights.json'
+WEIGHTS_KEY = 'wynnflip:v17:community_weight_profiles'
+
+def normalize_weight_profiles(raw):
+    """Validate source shapes. Never create estimated weights for missing IDs."""
+    result={}
+    if not isinstance(raw,dict):return result
+    for item, entry in raw.items():
+        profiles={}
+        if isinstance(entry,dict):
+            opts={'Main':entry} if entry and all(isinstance(v,(int,float)) and not isinstance(v,bool) for v in entry.values()) else entry
+        elif isinstance(entry,list):
+            opts={str(x.get('name') or x.get('profile') or 'Main'):x for x in entry if isinstance(x,dict)}
+        else:continue
+        for label, values in opts.items():
+            if not isinstance(values,dict):continue
+            weights=values.get('weights',values)
+            if not isinstance(weights,dict):continue
+            normalized={}
+            for k,v in weights.items():
+                if not isinstance(v,(int,float)) or isinstance(v,bool) or not math.isfinite(v) or not 0<abs(v)<=1:normalized={};break
+                normalized[normalized_name(k)]=float(v)
+            if normalized and .90<=sum(abs(x) for x in normalized.values())<=1.10:
+                profiles[str(label)]=normalized
+        if profiles:result[normalized_name(item)]=profiles
+    return result
+
+def _community_profiles_uncached(session):
+    """Read-through Redis cache avoids repeated upstream requests from serverless cold starts."""
+    local=load_profiles(ROOT/'profiles/item_weights.json')
+    if len(local)>=10:return local,'bundled',None
+    cached_weights,error=redis_call([['GET', WEIGHTS_KEY]])
+    if not error and cached_weights and cached_weights[0]:
+        try:
+            payload=json.loads(cached_weights[0]); profiles=normalize_weight_profiles(payload)
+            if len(profiles)>=10:return profiles,'Redis community profiles',None
+        except (TypeError,ValueError):pass
+    try:
+        response=get_json(session,WEIGHTS_URL,timeout=4)
+        profiles=normalize_weight_profiles(response)
+        if len(profiles)>=10:
+            if not error:redis_call([['SET',WEIGHTS_KEY,json.dumps(response,separators=(',',':')),'EX',86400*7]])
+            return profiles,'public community weights',None
+        return local,'unavailable','community-weight schema unrecognized'
+    except (requests.RequestException,ValueError,TypeError) as exc:
+        return local,'unavailable',type(exc).__name__
+
+def community_profiles(session):
+    return cached('v17:community_profiles',1800,lambda:_community_profiles_uncached(session))
+
+def v17_roll_evidence(items, live_rows, history_rows, profiles):
+    """Same item/variant/status, valid shared roll percentage similarity.
+
+    Prices stay as observed asking references, not sale predictions. An
+    unweighted roll match is a comparison, NOT a desirability ranking.
+    """
+    groups=defaultdict(dict)
+    for row in live_rows+history_rows:
+        if not isinstance(row,dict):continue
+        name=normalized_name(row.get('name'))
+        p=price_e(row)
+        if not name or not p or row.get('shiny_stat'):continue
+        # Only explicitly identified rows with valid stat percentages.
+        if identification_status(row) != 'identified':continue
+        rolls={normalized_name(k):v for k,v in roll_numbers(row).items() if v is not None}
+        if len(rolls)<2:continue
+        key=identity(row)
+        groups[name][key]=(p,rolls,row)
+    for item in items:
+        result={'status':'unavailable','method':'none','community_profile':None,'weighted_score':None,
+                'important_ids':[], 'matched_offer_count':0,'matched_asking_range_e':None,
+                'official_item_definitions':'On demand; open item details','note':'No verified sales or build popularity.'}
+        item['v17_roll_intel']=result
+        if item.get('identification_status')!='identified' or item.get('shiny_stat'):continue
+        own_ids=item.get('exact_ids') or []
+        own={normalized_name(x.get('api_name') or x.get('name')):number(x.get('roll_pct')) for x in own_ids if isinstance(x,dict)}
+        own={k:v for k,v in own.items() if k and v is not None and 0<=v<=100}
+        if len(own)<2:continue
+        # Use the original provider-supplied stat rolls for profile quality.
+        own_raw=next((r for r in live_rows if identity(r)==str(item.get('id'))),None)
+        if own_raw is None:
+            own_raw=next((r for r in live_rows if normalized_name(r.get('name'))==normalized_name(item.get('name')) and price_e(r)==number(item.get('price_e'))),None)
+        profile=profile_quality(own_raw,profiles) if own_raw else None
+        if profile:
+            result['community_profile']=profile.get('profile')
+            result['weighted_score']=profile.get('score')
+            result['important_ids']=profile.get('important_ids') or []
+        name=normalized_name(item.get('name'))
+        candidates=[]
+        for price,rr,row in groups[name].values():
+            if own_raw is not None and identity(row)==identity(own_raw):continue
+            # Only same rarity, subtype, and status where provider identifies those fields.
+            if item.get('rarity') and row.get('tier') and str(row.get('tier')).casefold()!=str(item.get('rarity')).casefold():continue
+            if item.get('subtype') and row.get('subtype') and str(row.get('subtype')).casefold()!=str(item.get('subtype')).casefold():continue
+            if item.get('item_type') and row.get('item_type') and str(row.get('item_type')).casefold()!=str(item.get('item_type')).casefold():continue
+            shared=set(own)&set(rr)
+            if len(shared)<2:continue
+            if profile:
+                weights={x['stat']:abs(float(x['weight'])) for x in result['important_ids']}
+                common=[k for k in shared if k in weights]
+                coverage=sum(weights[k] for k in common)
+                if coverage<.60:continue
+                distance=sum(abs(own[k]-rr[k])*weights[k] for k in common)/coverage
+                cutoff=18
+                mode='community-weighted roll similarity'
+            else:
+                if len(shared)<3:continue
+                distance=statistics.mean(abs(own[k]-rr[k]) for k in shared)
+                cutoff=12
+                mode='unweighted roll similarity'
+            if distance<=cutoff:candidates.append(price)
+        if candidates:
+            result['status']='matched_asking_evidence' if len(candidates)>=3 else 'thin_matching_evidence'
+            result['method']=mode
+            result['matched_offer_count']=len(candidates)
+            if len(candidates)>=3:
+                ordered=sorted(candidates)
+                result['matched_asking_range_e']={'low':ordered[max(0,int((len(ordered)-1)*.25))],
+                         'median':round(statistics.median(ordered)),
+                         'high':ordered[min(len(ordered)-1,int((len(ordered)-1)*.75))]}
+        elif profile:
+            result['status']='weighted_score_only'
+            result['method']='community-weighted roll score, no matched asking prices'
+        else:
+            result['status']='insufficient_roll_evidence'
+            result['method']='no verified community weight profile'
+    return sum(x['v17_roll_intel']['matched_asking_range_e'] is not None for x in items)
+
+# Official ranges are fetched only when a user asks, not on every market scan.
+@app.get('/api/roll-definition/{item_name}')
+def roll_definition(item_name:str):
+    if not item_name or len(item_name)>100 or '/' in item_name:return JSONResponse({'available':False,'reason':'Invalid name'},status_code=400)
+    def fetch():
+        with requests.Session() as sess:
+            try:
+                payload=get_json(sess,'https://api.wynncraft.com/v3/item/search/'+quote(item_name,safe=''),timeout=6)
+                if not isinstance(payload,list):return {'available':False,'reason':'Unrecognized official response'}
+                matching=next((r for r in payload if isinstance(r,dict) and normalized_name(r.get('displayName'))==normalized_name(item_name)),None)
+                if not matching:return {'available':False,'reason':'No exact official item match'}
+                return {'available':True,'item':matching.get('displayName'),'identifications':matching.get('identifications',{}),
+                        'source':'Official Wynncraft API v3','note':'Official ranges describe possible ID rolls, not resale prices.'}
+            except (requests.RequestException,ValueError,TypeError):return {'available':False,'reason':'Official API temporarily unavailable'}
+    return cached('official:'+normalized_name(item_name),3600,fetch)
 
 def apply_baselines(items,baselines,session,key):
     filled=0; lookups=0; groups=defaultdict(list)
@@ -883,7 +1029,7 @@ def fetch_market(key,session=None,limit_pages=5,page_size=100):
     # Bounded historical distinct observations, stored as explicit comparison-only data.
     prior=stored.get('observations',{}) if isinstance(stored.get('observations'),dict) else {}
     historical_rows=list(prior.values())[:8000]
-    profiles=load_profiles(ROOT/'profiles/item_weights.json')
+    profiles,weights_source,weights_error=community_profiles(session)
     items,_,_=build(rows,{'listings':{}},{},now,profiles,reference_rows=reference+historical_rows)
     unid_estimates=apply_unidentified_comparables(items,rows+reference+historical_rows)
     configured=bool(os.environ.get('UPSTASH_REDIS_REST_URL') and os.environ.get('UPSTASH_REDIS_REST_TOKEN'))
@@ -943,13 +1089,14 @@ def fetch_market(key,session=None,limit_pages=5,page_size=100):
     assess_sellability(items,rows,reference+historical_rows)
     mark_observation_freshness(items,now)
     trends=trend_summaries(stored,lifecycle_entries,now.timestamp())
+    roll_matches=v17_roll_evidence(items,rows,historical_rows,profiles)
     for item in items:
         item['v16_trend']=trends.get(str(item.get('name') or '').strip().casefold(), {'asking_price_trend':'insufficient'})
         item['v16_scenarios']=conservative_scenarios(item)
         item['v161_liquidity']=liquidity_evidence(item)
     items.sort(key=lambda x:x.get('listing_age_minutes') if x.get('listing_age_minutes') is not None else 1e10)
     timings['total']=round(time.perf_counter()-started,2)
-    return {'status':{'version':'16.0','scan_timings_seconds':timings,'updated_at':now.isoformat(),'scanned':len(rows),'exported':len(items),
+    return {'status':{'version':'17.0','scan_timings_seconds':timings,'updated_at':now.isoformat(),'scanned':len(rows),'exported':len(items),
        'recent_observations':sum(i.get('observation_freshness')=='recent' for i in items),
        'verification_needed':sum(i.get('observation_freshness')=='verify' for i in items),
        'stale_or_unknown':sum(i.get('observation_freshness') in ('stale','unknown') for i in items),
@@ -986,6 +1133,8 @@ def fetch_market(key,session=None,limit_pages=5,page_size=100):
        'speculative_leads':sum(i.get('v13_recommendation')=='speculative' and not i.get('low_value_filtered') for i in items),
        'research_candidates':sum(i.get('v12_signal')=='research' for i in items),
        'matched_profiles':sum(bool(i.get('wynnpool')) for i in items),
+       'v17_weight_source':weights_source,'v17_weight_error':weights_error,
+       'v17_profiles_loaded':len(profiles),'v17_roll_comparable_items':roll_matches,
        'partial_scan':not complete_scan,
        'notes':'Lifecycle counts are observations, not sales. Incomplete scans never imply a listing disappeared.'},
        'listings':items}
@@ -1088,7 +1237,7 @@ def pool_names(payload):
 def lootpool_fetch(session,key):
     now=datetime.now(timezone.utc)
     week=now.isocalendar()
-    result={'version':'16.0','iso_year':week.year,'iso_week':week.week,'updated_at':now.isoformat(),
+    result={'version':'17.0','iso_year':week.year,'iso_week':week.week,'updated_at':now.isoformat(),
             'available':False,'items':[],'added':[],'removed':[],
             'source':'WynnVentory weekly lootpool','error':None,'historical_comparison':'unavailable',
             'warning':'Lootpool presence indicates potential incoming supply, not sales or future prices.'}
